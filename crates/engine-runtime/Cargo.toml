@@ -1,0 +1,21 @@
+[package]
+name = "engine-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dedicated threads, bounded SPSC queues, journal, and backpressure around the trading core"
+
+[dependencies]
+protocol.workspace = true
+trading-core.workspace = true
+crc32fast.workspace = true
+crossbeam-queue.workspace = true
+crossbeam-utils.workspace = true
+hdrhistogram.workspace = true
+rtrb.workspace = true
+
+[[bench]]
+name = "pipeline"
+harness = false

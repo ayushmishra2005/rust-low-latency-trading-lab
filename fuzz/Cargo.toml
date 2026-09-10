@@ -1,0 +1,33 @@
+[package]
+name = "protocol-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+protocol = { path = "../crates/protocol" }
+
+[[bin]]
+name = "decode_frame"
+path = "fuzz_targets/decode_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_header"
+path = "fuzz_targets/decode_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_output"
+path = "fuzz_targets/decode_output.rs"
+test = false
+doc = false
+bench = false

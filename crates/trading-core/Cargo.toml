@@ -1,0 +1,21 @@
+[package]
+name = "trading-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure deterministic trading state machine: market view, order book, matching, risk, replay"
+
+[dependencies]
+protocol.workspace = true
+blake3.workspace = true
+slab.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "core"
+harness = false

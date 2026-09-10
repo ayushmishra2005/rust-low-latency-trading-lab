@@ -1,0 +1,8 @@
+# Golden digests for fixtures/feeds/seed2-500-faults.feed.
+# Regenerate: cargo run --release -p simulator -- replay --input fixtures/feeds/seed2-500-faults.feed
+inputs = 522
+outputs = 547
+trades = 81
+input_digest = 3a49745542d4dde394fb2f559d7d5cdea96c1caa06e526d399516dd1a9fe03f7
+output_digest = 0d795ec9298f662628c1876935abc72d32f5d21d8e26c388e1fb12eec02e31b7
+state_digest = ab151a57126d90000c1a6e99595dce69c5ceeb5e5356291dfcd89324b917ebe2
