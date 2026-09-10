@@ -281,3 +281,32 @@ async fn replay_runs_on_an_isolated_core_and_is_reproducible() {
     .await;
     assert_eq!(missing["error"]["code"], "not_found");
 }
+
+#[tokio::test]
+async fn a_corrupt_journal_tail_is_reported_and_does_not_kill_the_gateway() {
+    let fixture = Fixture::new("corrupt");
+    run_engine(&fixture, 500);
+
+    // Flip a byte inside the first record so its checksum no longer matches.
+    let mut bytes = std::fs::read(&fixture.journal).expect("read journal");
+    let offset = bytes.len() / 2;
+    bytes[offset] ^= 0xff;
+    std::fs::write(&fixture.journal, &bytes).expect("write journal");
+
+    serve(&fixture, Some("secret"));
+    let mut stream = client(&fixture).await;
+
+    let mut failed = false;
+    for _ in 0..10 {
+        let response = call(&mut stream, "outputs", json!({ "limit": 100 }), None).await;
+        if !response["ok"].as_bool().unwrap() {
+            assert_eq!(response["error"]["code"], "journal_error");
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed, "the corrupt record should have been reported");
+
+    let healthy = call(&mut stream, "health", json!({}), None).await;
+    assert!(healthy["ok"].as_bool().unwrap());
+}
