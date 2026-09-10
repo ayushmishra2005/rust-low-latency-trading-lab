@@ -10,6 +10,7 @@ import { manifestHash, settlementIdFor } from '../src/settlement/manifest.js';
 import { SettlementDispatcher } from '../src/settlement/dispatcher.js';
 import { SettlementOutbox } from '../src/settlement/outbox.js';
 import { SimulatedVenue } from '../src/settlement/simulated.js';
+import { buildVenue } from '../src/settlement/venue.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rltl-settle-'));
 
@@ -43,6 +44,12 @@ function insertTrades(db: Database.Database, count: number, from = 1): void {
     insert.run(id, id, id, id);
   }
 }
+
+test('the venue factory defaults to the simulated venue and reports missing config', () => {
+  assert.equal(buildVenue({}).venue, 'simulated');
+  assert.throws(() => buildVenue({ RLTL_SETTLEMENT_VENUE: 'canton' }), /RLTL_CANTON_JSON_API/);
+  assert.throws(() => buildVenue({ RLTL_SETTLEMENT_VENUE: 'nope' }), /unknown settlement venue/);
+});
 
 test('the settlement identity and manifest hash are stable across rebuilds', () => {
   const { outbox } = fixture('stable');

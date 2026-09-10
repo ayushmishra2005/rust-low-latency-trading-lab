@@ -5,13 +5,13 @@ import { Projection } from './projection.js';
 import { buildServer } from './server.js';
 import { SettlementDispatcher } from './settlement/dispatcher.js';
 import { SettlementOutbox } from './settlement/outbox.js';
-import { SimulatedVenue } from './settlement/simulated.js';
+import { buildVenue } from './settlement/venue.js';
 
 const config = loadConfig();
 const db = openDatabase(config.databasePath);
 const gateway = new GatewayClient(config.socketPath, config.gatewayToken);
 const projection = new Projection(db, gateway);
-const venue = new SimulatedVenue();
+const venue = buildVenue();
 const outbox = new SettlementOutbox(db, venue.venue);
 const dispatcher = new SettlementDispatcher(outbox, venue, config.settlementBatchSize);
 

@@ -1,0 +1,115 @@
+-- Settlement workflow for the trading lab.
+--
+-- Canton is a settlement boundary. Matching and execution happen in the Rust
+-- engine; only the resulting obligations arrive here. A settlement is
+-- identified by the same settlement id the engine outbox uses, so a resubmitted
+-- batch is recognised instead of settled twice.
+
+module Settlement where
+
+import DA.Foldable (forA_)
+import DA.List (dedup)
+
+-- | Cash position held by one party at one operator.
+--
+-- This is a minimal lab holding, not a token standard. A production deployment
+-- would settle against the holdings of the token standard already deployed on
+-- the target Canton network.
+template Holding
+  with
+    operator : Party
+    owner : Party
+    amount : Int
+  where
+    signatory operator
+    observer owner
+    ensure amount >= 0
+
+    key (operator, owner) : (Party, Party)
+    maintainer key._1
+
+    choice Credit : ContractId Holding
+      with delta : Int
+      controller operator
+      do
+        assertMsg "credit must be positive" (delta > 0)
+        create this with amount = amount + delta
+
+    choice Debit : ContractId Holding
+      with delta : Int
+      controller operator
+      do
+        assertMsg "debit must be positive" (delta > 0)
+        assertMsg "insufficient holding" (amount >= delta)
+        create this with amount = amount - delta
+
+-- | One obligation inside a batch: payer owes payee an amount.
+data Leg = Leg
+  with
+    payer : Party
+    payee : Party
+    amount : Int
+  deriving (Eq, Show)
+
+-- | Proof that a settlement identity was applied. The contract key makes the
+-- identity unique, so a duplicate submission fails instead of paying twice.
+template SettlementReceipt
+  with
+    operator : Party
+    settlementId : Text
+    manifestHash : Text
+    legs : [Leg]
+    parties : [Party]
+  where
+    signatory operator
+    observer parties
+
+    key (operator, settlementId) : (Party, Text)
+    maintainer key._1
+
+-- | Operator request to settle a batch. Every affected party is a signatory of
+-- the resulting transfer, so nothing moves without their authority.
+template SettlementInstruction
+  with
+    operator : Party
+    settlementId : Text
+    manifestHash : Text
+    legs : [Leg]
+    accepted : [Party]
+  where
+    signatory operator, accepted
+    observer involvedParties legs
+    ensure not (null legs)
+
+    choice Accept : ContractId SettlementInstruction
+      with party : Party
+      controller party
+      do
+        assertMsg "party is not part of this settlement" (party `elem` involvedParties legs)
+        assertMsg "party already accepted" (notElem party accepted)
+        create this with accepted = party :: accepted
+
+    -- | Applies every leg atomically and records the receipt.
+    choice Settle : ContractId SettlementReceipt
+      controller operator
+      do
+        let parties = involvedParties legs
+        assertMsg "every involved party must accept first" (all (`elem` accepted) parties)
+        forA_ legs \leg -> do
+          assertMsg "leg amount must be positive" (leg.amount > 0)
+          assertMsg "a leg cannot pay itself" (leg.payer /= leg.payee)
+          exerciseByKey @Holding (operator, leg.payer) Debit with delta = leg.amount
+          exerciseByKey @Holding (operator, leg.payee) Credit with delta = leg.amount
+        create SettlementReceipt with
+          operator
+          settlementId
+          manifestHash
+          legs
+          parties
+
+    choice Withdraw : ()
+      controller operator
+      do pure ()
+
+involvedParties : [Leg] -> [Party]
+involvedParties legs = dedup (concatMap (\leg -> [leg.payer, leg.payee]) legs)
