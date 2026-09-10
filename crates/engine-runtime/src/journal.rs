@@ -169,6 +169,72 @@ pub fn read_journal(path: &Path) -> Result<JournalRecovery, JournalError> {
     })
 }
 
+/// Incremental reader for a growing journal. The gateway uses it to stream
+/// durable output events to cold consumers without touching engine state.
+pub struct JournalTail {
+    path: std::path::PathBuf,
+    offset: usize,
+}
+
+impl JournalTail {
+    pub fn open(path: &Path) -> JournalTail {
+        JournalTail {
+            path: path.to_path_buf(),
+            offset: 0,
+        }
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Returns records that became complete since the last poll.
+    pub fn poll(&mut self, limit: usize) -> Result<Vec<OutputEvent>, JournalError> {
+        let mut bytes = Vec::new();
+        File::open(&self.path)?.read_to_end(&mut bytes)?;
+        if bytes.len() < HEADER_LEN || bytes[..4] != MAGIC {
+            return Err(JournalError::BadHeader);
+        }
+        if self.offset < HEADER_LEN {
+            self.offset = HEADER_LEN;
+        }
+
+        let mut events = Vec::new();
+        while events.len() < limit && self.offset + 4 <= bytes.len() {
+            let offset = self.offset;
+            let len = u32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]);
+            if len == 0 || len > MAX_RECORD_LEN {
+                return Err(JournalError::Corrupt(offset));
+            }
+            let end = offset + 4 + len as usize + 4;
+            if end > bytes.len() {
+                break;
+            }
+            let payload = &bytes[offset + 4..end - 4];
+            let stored = u32::from_le_bytes([
+                bytes[end - 4],
+                bytes[end - 3],
+                bytes[end - 2],
+                bytes[end - 1],
+            ]);
+            if stored != crc32fast::hash(payload) {
+                return Err(JournalError::Corrupt(offset));
+            }
+            match canonical::decode_output(payload) {
+                Ok((event, consumed)) if consumed == payload.len() => events.push(event),
+                _ => return Err(JournalError::Corrupt(offset)),
+            }
+            self.offset = end;
+        }
+        Ok(events)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

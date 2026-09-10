@@ -31,6 +31,9 @@ pub struct PipelineConfig {
     /// Engine sequences between read-model snapshots. Zero disables them.
     pub snapshot_interval: u64,
     pub snapshot_depth: usize,
+    /// Reproduce recorded inter-arrival deltas instead of publishing as fast as
+    /// possible. Used for demos, not for latency measurement.
+    pub paced: bool,
 }
 
 impl Default for PipelineConfig {
@@ -45,6 +48,7 @@ impl Default for PipelineConfig {
             checkpoint_interval: 0,
             snapshot_interval: 0,
             snapshot_depth: 16,
+            paced: false,
         }
     }
 }
@@ -196,6 +200,7 @@ pub fn run(
 
     let started = Instant::now();
     let feed_control = control.clone();
+    let paced = pipeline_config.paced;
     let feed = std::thread::Builder::new()
         .name("feed".to_string())
         .spawn(move || {
@@ -203,9 +208,17 @@ pub fn run(
             let mut decode_errors = 0u64;
             match source {
                 FeedSource::Memory(inputs) => {
+                    let mut previous_recv_ns = inputs.first().map_or(0, |first| first.recv_time_ns);
                     for input in inputs {
                         if feed_control.shutdown_requested() {
                             break;
+                        }
+                        if paced {
+                            let delta = input.recv_time_ns.saturating_sub(previous_recv_ns);
+                            previous_recv_ns = input.recv_time_ns;
+                            if delta > 0 {
+                                std::thread::sleep(std::time::Duration::from_nanos(delta));
+                            }
                         }
                         recorder.record_input(&input);
                         if !input_tx.send(input) {

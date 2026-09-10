@@ -381,7 +381,7 @@ fn cancelled_orders_never_trade_again() {
 }
 
 #[test]
-fn output_sequences_are_strictly_monotonic() {
+fn output_sequences_are_dense_and_increasing() {
     let mut harness = Harness::new();
     harness.sync_feed();
     harness.limit(1, 100, Side::Sell, 101, 10);
@@ -391,7 +391,8 @@ fn output_sequences_are_strictly_monotonic() {
     let mut previous = 0;
     for event in &harness.events {
         let seq = event.output_seq().0;
-        assert!(seq > previous, "output sequence {seq} not increasing");
+        // A gap would mean an emitted event never reached a consumer.
+        assert_eq!(seq, previous + 1, "output sequence {seq} skipped a value");
         previous = seq;
     }
 }

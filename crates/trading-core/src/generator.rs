@@ -3,6 +3,8 @@
 //! The same seed and configuration always produce the same normalized event
 //! sequence. This is a workload generator, not a trading strategy.
 
+use std::collections::BTreeMap;
+
 use protocol::codec::{Frame, FrameBody};
 use protocol::{
     AccountId, ClientOrderId, EngineInput, IngressSeq, InputEvent, InstrumentId, MarketEvent,
@@ -68,6 +70,9 @@ pub struct Generator {
     client_seq: Vec<u64>,
     live: Vec<LiveClientOrder>,
     mid: i64,
+    // Published depth, so the generated market never crosses itself.
+    bids: BTreeMap<i64, u64>,
+    asks: BTreeMap<i64, u64>,
 }
 
 impl Generator {
@@ -86,6 +91,8 @@ impl Generator {
             client_seq: vec![0; accounts],
             live: Vec::new(),
             mid,
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
         }
     }
 
@@ -114,6 +121,29 @@ impl Generator {
     }
 
     fn push_market(&mut self, kind: MarketEventKind, inputs: &mut Vec<EngineInput>) {
+        match kind {
+            MarketEventKind::SnapshotLevel {
+                side,
+                price,
+                quantity,
+            }
+            | MarketEventKind::LevelSet {
+                side,
+                price,
+                quantity,
+            } => {
+                let levels = match side {
+                    Side::Buy => &mut self.bids,
+                    Side::Sell => &mut self.asks,
+                };
+                if quantity.0 == 0 {
+                    levels.remove(&price.0);
+                } else {
+                    levels.insert(price.0, quantity.0);
+                }
+            }
+            _ => {}
+        }
         self.source_seq += 1;
         let event = InputEvent::Market(MarketEvent {
             instrument: self.config.instrument,
@@ -174,7 +204,7 @@ impl Generator {
         }
 
         let roll = self.rng.below(10);
-        let kind = if roll < 6 {
+        if roll < 6 {
             let side = if self.rng.below(2) == 0 {
                 Side::Buy
             } else {
@@ -185,12 +215,22 @@ impl Generator {
                 Side::Buy => self.mid - depth,
                 Side::Sell => self.mid + depth,
             };
-            MarketEventKind::LevelSet {
-                side,
-                price: PriceTicks(price),
-                quantity: QuantityLots(self.rng.below(50)),
+            let quantity = QuantityLots(self.rng.below(50));
+            if quantity.0 > 0 {
+                self.clear_crossing(side, price, inputs);
             }
-        } else if roll < 9 {
+            self.push_market(
+                MarketEventKind::LevelSet {
+                    side,
+                    price: PriceTicks(price),
+                    quantity,
+                },
+                inputs,
+            );
+            return;
+        }
+
+        let kind = if roll < 9 {
             let side = if self.rng.below(2) == 0 {
                 Side::Buy
             } else {
@@ -205,6 +245,28 @@ impl Generator {
             MarketEventKind::Heartbeat
         };
         self.push_market(kind, inputs);
+    }
+
+    /// Removes opposite-side levels that a new level would trade through.
+    fn clear_crossing(&mut self, side: Side, price: i64, inputs: &mut Vec<EngineInput>) {
+        let crossed: Vec<i64> = match side {
+            Side::Buy => self.asks.range(..=price).map(|(key, _)| *key).collect(),
+            Side::Sell => self.bids.range(price..).map(|(key, _)| *key).collect(),
+        };
+        let other = match side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+        for level in crossed {
+            self.push_market(
+                MarketEventKind::LevelSet {
+                    side: other,
+                    price: PriceTicks(level),
+                    quantity: QuantityLots(0),
+                },
+                inputs,
+            );
+        }
     }
 
     fn emit_order(&mut self, inputs: &mut Vec<EngineInput>) {

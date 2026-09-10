@@ -4,6 +4,7 @@ members = [
     "crates/protocol",
     "crates/trading-core",
     "crates/engine-runtime",
+    "crates/control-gateway",
     "apps/simulator",
 ]
 

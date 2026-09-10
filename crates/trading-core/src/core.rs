@@ -615,7 +615,6 @@ impl TradingCore {
             }
 
             let mut taker_report = self.base_report(request, order_id);
-            taker_report.output_seq = self.take_output_seq();
             taker_report.kind = if taker_cumulative == quantity {
                 ReportKind::Filled
             } else {
