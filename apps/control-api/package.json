@@ -16,12 +16,15 @@
     "start": "node --import tsx src/index.ts"
   },
   "dependencies": {
+    "@coral-xyz/anchor": "^0.31.1",
     "@fastify/websocket": "^11.0.2",
+    "@solana/web3.js": "^1.99.0",
     "better-sqlite3": "^11.7.0",
     "fastify": "^5.2.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",
+    "@solana/spl-token": "^0.4.15",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.2",
     "eslint": "^9.17.0",
