@@ -5,11 +5,39 @@
 //! recognised by its receipt, so a retry after a timeout cannot settle twice.
 
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::hash::hash;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 declare_id!("HYAoYYczVZE7scJbDP2EGA8FbLYspcxrw9BRLQ4i6ux4");
 
 pub const MAX_LEGS: usize = 32;
+
+/// Domain tag: the 16 ASCII bytes `RLTL-SETTLE-V1  ` (two trailing spaces).
+pub const MANIFEST_DOMAIN: &[u8; 16] = b"RLTL-SETTLE-V1  ";
+
+/// Canonical hash of the settlement legs.
+///
+/// Preimage: domain tag (16), settlement id (16), exchange key (32), leg count
+/// as u16 little-endian, then for each leg in the supplied order the payer
+/// collateral key (32), the payee collateral key (32) and the amount as u64
+/// little-endian. Hashed with sha256.
+pub fn manifest_hash(
+    settlement_id: &[u8; 16],
+    exchange: &Pubkey,
+    legs: &[(Pubkey, Pubkey, u64)],
+) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(66 + legs.len() * 72);
+    bytes.extend_from_slice(MANIFEST_DOMAIN);
+    bytes.extend_from_slice(settlement_id);
+    bytes.extend_from_slice(exchange.as_ref());
+    bytes.extend_from_slice(&(legs.len() as u16).to_le_bytes());
+    for (payer, payee, amount) in legs {
+        bytes.extend_from_slice(payer.as_ref());
+        bytes.extend_from_slice(payee.as_ref());
+        bytes.extend_from_slice(&amount.to_le_bytes());
+    }
+    hash(&bytes).to_bytes()
+}
 
 #[program]
 pub mod settlement {
@@ -128,6 +156,35 @@ pub mod settlement {
         let exchange_key = context.accounts.exchange.key();
         let accounts = context.remaining_accounts;
 
+        // Every supplied collateral account must be distinct, writable, owned by
+        // this exchange, and at its canonical address. Two entries for the same
+        // account would let one leg overwrite another leg's balance.
+        for (position, info) in accounts.iter().enumerate() {
+            require!(info.is_writable, SettlementError::AccountNotWritable);
+            for other in accounts.iter().take(position) {
+                require_keys_neq!(*info.key, *other.key, SettlementError::DuplicateAccount);
+            }
+            let collateral: Account<Collateral> = Account::try_from(info)?;
+            require_keys_eq!(
+                collateral.exchange,
+                exchange_key,
+                SettlementError::WrongExchange
+            );
+            let expected = Pubkey::create_program_address(
+                &[
+                    b"collateral",
+                    exchange_key.as_ref(),
+                    collateral.owner.as_ref(),
+                    &[collateral.bump],
+                ],
+                &crate::ID,
+            )
+            .map_err(|_| SettlementError::InvalidCollateralAddress)?;
+            require_keys_eq!(*info.key, expected, SettlementError::InvalidCollateralAddress);
+        }
+
+        // Resolve every leg to the collateral account keys it moves value between.
+        let mut resolved: Vec<(Pubkey, Pubkey, u64)> = Vec::with_capacity(legs.len());
         for leg in legs.iter() {
             require!(leg.amount > 0, SettlementError::ZeroAmount);
             require!(leg.payer != leg.payee, SettlementError::SelfSettlement);
@@ -138,11 +195,28 @@ pub mod settlement {
             let payee_info = accounts
                 .get(usize::from(leg.payee))
                 .ok_or(SettlementError::MissingAccount)?;
+            require_keys_neq!(
+                *payer_info.key,
+                *payee_info.key,
+                SettlementError::SelfSettlement
+            );
+            resolved.push((*payer_info.key, *payee_info.key, leg.amount));
+        }
+
+        // The supplied hash must describe the legs that are about to be applied.
+        let computed = crate::manifest_hash(&settlement_id, &exchange_key, &resolved);
+        require!(computed == manifest_hash, SettlementError::ManifestMismatch);
+
+        for leg in legs.iter() {
+            let payer_info = accounts
+                .get(usize::from(leg.payer))
+                .ok_or(SettlementError::MissingAccount)?;
+            let payee_info = accounts
+                .get(usize::from(leg.payee))
+                .ok_or(SettlementError::MissingAccount)?;
 
             let mut payer: Account<Collateral> = Account::try_from(payer_info)?;
             let mut payee: Account<Collateral> = Account::try_from(payee_info)?;
-            require_keys_eq!(payer.exchange, exchange_key, SettlementError::WrongExchange);
-            require_keys_eq!(payee.exchange, exchange_key, SettlementError::WrongExchange);
             require!(!payer.frozen && !payee.frozen, SettlementError::AccountFrozen);
             require!(
                 payer.balance >= leg.amount,
@@ -360,4 +434,69 @@ pub enum SettlementError {
     MissingAccount,
     #[msg("collateral account belongs to another exchange")]
     WrongExchange,
+    #[msg("the same collateral account was supplied twice")]
+    DuplicateAccount,
+    #[msg("collateral account must be writable")]
+    AccountNotWritable,
+    #[msg("collateral account is not at its canonical address")]
+    InvalidCollateralAddress,
+    #[msg("manifest hash does not match the supplied legs")]
+    ManifestMismatch,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Golden vector shared with the TypeScript client.
+    #[test]
+    fn manifest_hash_matches_the_golden_vector() {
+        let mut settlement_id = [0u8; 16];
+        for (index, byte) in settlement_id.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let exchange = Pubkey::new_from_array([0x11; 32]);
+        let legs = [
+            (
+                Pubkey::new_from_array([0x21; 32]),
+                Pubkey::new_from_array([0x22; 32]),
+                1_000u64,
+            ),
+            (
+                Pubkey::new_from_array([0x22; 32]),
+                Pubkey::new_from_array([0x23; 32]),
+                250_000u64,
+            ),
+        ];
+
+        let digest = manifest_hash(&settlement_id, &exchange, &legs);
+        assert_eq!(
+            hex(&digest),
+            "d11c5555601792674da104cd7a9b35046858ec7d025f9e02cf1c2c83d9e9bd9a"
+        );
+    }
+
+    #[test]
+    fn leg_order_changes_the_hash() {
+        let settlement_id = [7u8; 16];
+        let exchange = Pubkey::new_from_array([0x11; 32]);
+        let a = (
+            Pubkey::new_from_array([0x21; 32]),
+            Pubkey::new_from_array([0x22; 32]),
+            1u64,
+        );
+        let b = (
+            Pubkey::new_from_array([0x23; 32]),
+            Pubkey::new_from_array([0x24; 32]),
+            2u64,
+        );
+        assert_ne!(
+            manifest_hash(&settlement_id, &exchange, &[a, b]),
+            manifest_hash(&settlement_id, &exchange, &[b, a])
+        );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 }

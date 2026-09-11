@@ -46,22 +46,39 @@ impl From<std::io::Error> for JournalError {
 }
 
 pub struct JournalWriter {
-    file: BufWriter<File>,
+    sink: BufWriter<Box<dyn Write + Send>>,
+    /// Kept only for on-disk journals so `sync` can reach the file descriptor.
+    file: Option<File>,
     scratch: Vec<u8>,
     records: u64,
 }
 
 impl JournalWriter {
     pub fn create(path: &Path, run_id: u128) -> Result<JournalWriter, JournalError> {
-        let mut file = BufWriter::new(File::create(path)?);
+        let file = File::create(path)?;
+        let handle = file.try_clone()?;
+        let mut writer = JournalWriter::with_sink(Box::new(file), run_id)?;
+        writer.file = Some(handle);
+        Ok(writer)
+    }
+
+    /// Writes the journal to any sink. Used for in-memory and failure testing.
+    pub fn with_sink(
+        sink: Box<dyn Write + Send>,
+        run_id: u128,
+    ) -> Result<JournalWriter, JournalError> {
+        let mut sink = BufWriter::new(sink);
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(&MAGIC);
         header.extend_from_slice(&VERSION.to_le_bytes());
         header.extend_from_slice(&0u16.to_le_bytes());
         header.extend_from_slice(&run_id.to_le_bytes());
-        file.write_all(&header)?;
+        // Publish the header at once so a reader can attach immediately.
+        sink.write_all(&header)?;
+        sink.flush()?;
         Ok(JournalWriter {
-            file,
+            sink,
+            file: None,
             scratch: Vec::with_capacity(256),
             records: 0,
         })
@@ -76,22 +93,24 @@ impl JournalWriter {
         canonical::encode_output(event, &mut self.scratch);
         let len = self.scratch.len() as u32;
         let crc = crc32fast::hash(&self.scratch);
-        self.file.write_all(&len.to_le_bytes())?;
-        self.file.write_all(&self.scratch)?;
-        self.file.write_all(&crc.to_le_bytes())?;
+        self.sink.write_all(&len.to_le_bytes())?;
+        self.sink.write_all(&self.scratch)?;
+        self.sink.write_all(&crc.to_le_bytes())?;
         self.records += 1;
         Ok(())
     }
 
     /// Flushes buffered records. Durability mode decides how often this runs.
     pub fn flush(&mut self) -> Result<(), JournalError> {
-        self.file.flush()?;
+        self.sink.flush()?;
         Ok(())
     }
 
     pub fn sync(&mut self) -> Result<(), JournalError> {
-        self.file.flush()?;
-        self.file.get_ref().sync_data()?;
+        self.sink.flush()?;
+        if let Some(file) = self.file.as_ref() {
+            file.sync_data()?;
+        }
         Ok(())
     }
 }
@@ -172,64 +191,85 @@ pub fn read_journal(path: &Path) -> Result<JournalRecovery, JournalError> {
 /// Incremental reader for a growing journal. The gateway uses it to stream
 /// durable output events to cold consumers without touching engine state.
 pub struct JournalTail {
-    path: std::path::PathBuf,
+    file: File,
+    /// Offset of the first record not yet returned.
     offset: usize,
+    /// Bytes read from `offset` onwards that did not form a whole record yet.
+    pending: Vec<u8>,
+    bytes_read: u64,
 }
 
 impl JournalTail {
-    pub fn open(path: &Path) -> JournalTail {
-        JournalTail {
-            path: path.to_path_buf(),
-            offset: 0,
+    pub fn open(path: &Path) -> Result<JournalTail, JournalError> {
+        let mut file = File::open(path)?;
+        let mut header = [0u8; HEADER_LEN];
+        file.read_exact(&mut header)?;
+        if header[..4] != MAGIC || u16::from_le_bytes([header[4], header[5]]) != VERSION {
+            return Err(JournalError::BadHeader);
         }
+        Ok(JournalTail {
+            file,
+            offset: HEADER_LEN,
+            pending: Vec::new(),
+            bytes_read: 0,
+        })
     }
 
     pub fn offset(&self) -> usize {
         self.offset
     }
 
-    /// Returns records that became complete since the last poll.
+    /// Journal bytes this reader has pulled from the file. A poll must never
+    /// re-read bytes it already consumed.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Returns records that became complete since the last poll. Only bytes
+    /// appended since the last poll are read.
     pub fn poll(&mut self, limit: usize) -> Result<Vec<OutputEvent>, JournalError> {
-        let mut bytes = Vec::new();
-        File::open(&self.path)?.read_to_end(&mut bytes)?;
-        if bytes.len() < HEADER_LEN || bytes[..4] != MAGIC {
-            return Err(JournalError::BadHeader);
-        }
-        if self.offset < HEADER_LEN {
-            self.offset = HEADER_LEN;
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = self.file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            self.pending.extend_from_slice(&chunk[..read]);
+            self.bytes_read += read as u64;
         }
 
         let mut events = Vec::new();
-        while events.len() < limit && self.offset + 4 <= bytes.len() {
-            let offset = self.offset;
-            let len = u32::from_le_bytes([
-                bytes[offset],
-                bytes[offset + 1],
-                bytes[offset + 2],
-                bytes[offset + 3],
-            ]);
-            if len == 0 || len > MAX_RECORD_LEN {
-                return Err(JournalError::Corrupt(offset));
-            }
-            let end = offset + 4 + len as usize + 4;
-            if end > bytes.len() {
+        let mut consumed = 0usize;
+        while events.len() < limit {
+            let rest = &self.pending[consumed..];
+            if rest.len() < 4 {
                 break;
             }
-            let payload = &bytes[offset + 4..end - 4];
-            let stored = u32::from_le_bytes([
-                bytes[end - 4],
-                bytes[end - 3],
-                bytes[end - 2],
-                bytes[end - 1],
-            ]);
+            let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+            if len == 0 || len > MAX_RECORD_LEN {
+                return Err(JournalError::Corrupt(self.offset + consumed));
+            }
+            let end = 4 + len as usize + 4;
+            if rest.len() < end {
+                // Hold an incomplete record until the writer finishes it.
+                break;
+            }
+            let payload = &rest[4..end - 4];
+            let stored =
+                u32::from_le_bytes([rest[end - 4], rest[end - 3], rest[end - 2], rest[end - 1]]);
             if stored != crc32fast::hash(payload) {
-                return Err(JournalError::Corrupt(offset));
+                return Err(JournalError::Corrupt(self.offset + consumed));
             }
             match canonical::decode_output(payload) {
-                Ok((event, consumed)) if consumed == payload.len() => events.push(event),
-                _ => return Err(JournalError::Corrupt(offset)),
+                Ok((event, used)) if used == payload.len() => events.push(event),
+                _ => return Err(JournalError::Corrupt(self.offset + consumed)),
             }
-            self.offset = end;
+            consumed += end;
+        }
+
+        if consumed > 0 {
+            self.pending.drain(..consumed);
+            self.offset += consumed;
         }
         Ok(events)
     }
@@ -293,6 +333,75 @@ mod tests {
         assert_eq!(recovered.events.len(), 4);
         assert!(recovered.truncated_at.is_some());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn the_tail_reads_each_record_once_and_only_reads_new_bytes() {
+        let dir = std::env::temp_dir().join(format!("rltl-journal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tail-incremental.journal");
+
+        let mut writer = JournalWriter::create(&path, 5).unwrap();
+        writer.flush().unwrap();
+        let mut tail = JournalTail::open(&path).unwrap();
+        assert!(tail.poll(100).unwrap().is_empty());
+
+        let mut seen = Vec::new();
+        let mut seq = 0u64;
+        for batch in 1..=4u64 {
+            for _ in 0..batch {
+                seq += 1;
+                writer.append(&sample(seq)).unwrap();
+            }
+            writer.flush().unwrap();
+
+            let before = tail.bytes_read();
+            let events = tail.poll(100).unwrap();
+            let read = tail.bytes_read() - before;
+            assert_eq!(events.len() as u64, batch);
+            // Only the newly appended bytes were pulled from the file.
+            assert!(read > 0 && read < 200 * batch, "read {read} bytes");
+            seen.extend(events);
+        }
+
+        assert_eq!(seen.len(), 10);
+        for (index, event) in seen.iter().enumerate() {
+            assert_eq!(*event, sample(index as u64 + 1));
+        }
+        assert_eq!(
+            tail.offset(),
+            std::fs::metadata(&path).unwrap().len() as usize
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn the_tail_holds_a_partial_record_until_it_is_complete() {
+        let dir = std::env::temp_dir().join(format!("rltl-journal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tail-partial.journal");
+
+        // Build a complete two record journal, then publish it byte by byte.
+        let mut writer = JournalWriter::create(&path, 5).unwrap();
+        writer.append(&sample(1)).unwrap();
+        writer.append(&sample(2)).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+        let full = std::fs::read(&path).unwrap();
+
+        let partial = path.with_extension("partial");
+        std::fs::write(&partial, &full[..HEADER_LEN]).unwrap();
+        let mut tail = JournalTail::open(&partial).unwrap();
+
+        let mut delivered = Vec::new();
+        for end in HEADER_LEN + 1..=full.len() {
+            std::fs::write(&partial, &full[..end]).unwrap();
+            delivered.extend(tail.poll(100).unwrap());
+        }
+        assert_eq!(delivered, vec![sample(1), sample(2)]);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&partial).unwrap();
     }
 
     #[test]

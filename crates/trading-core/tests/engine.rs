@@ -141,7 +141,7 @@ fn replace_decrease_at_the_same_price_keeps_priority() {
     let before = harness.core.instrument(support::INSTRUMENT).unwrap();
     let priority = before.book.level_orders(Side::Buy, PriceTicks(99))[0].priority;
 
-    let report = last_report(harness.replace(1, 100, 99, 5));
+    let report = last_report(harness.replace(1, 100, Side::Buy, 99, 5));
     assert_eq!(report.kind, ReportKind::Replaced);
     assert_eq!(report.remaining, QuantityLots(5));
 
@@ -159,7 +159,7 @@ fn replace_increase_loses_priority() {
     harness.limit(1, 100, Side::Buy, 99, 10);
     harness.limit(2, 200, Side::Buy, 99, 10);
 
-    harness.replace(1, 100, 99, 20);
+    harness.replace(1, 100, Side::Buy, 99, 20);
 
     let book = &harness.core.instrument(support::INSTRUMENT).unwrap().book;
     let orders = book.level_orders(Side::Buy, PriceTicks(99));
@@ -176,7 +176,7 @@ fn replace_below_cumulative_fill_is_rejected_and_changes_nothing() {
     harness.limit(2, 200, Side::Buy, 101, 6);
 
     let digest_before = trading_core::state_digest(&harness.core);
-    let report = last_report(harness.replace(1, 100, 101, 3));
+    let report = last_report(harness.replace(1, 100, Side::Sell, 101, 3));
     assert_eq!(
         report.reject_reason,
         Some(RejectReason::InvalidReplaceQuantity)
@@ -196,9 +196,183 @@ fn replace_to_the_cumulative_fill_cancels_the_remainder() {
     harness.limit(1, 100, Side::Sell, 101, 10);
     harness.limit(2, 200, Side::Buy, 101, 6);
 
-    let report = last_report(harness.replace(1, 100, 101, 6));
+    let report = last_report(harness.replace(1, 100, Side::Sell, 101, 6));
     assert_eq!(report.kind, ReportKind::Cancelled);
     assert_eq!(harness.core.live_order_count(), 0);
+    harness.check_invariants();
+}
+
+/// Prices no venue may quote, including the ones that used to overflow the
+/// collar subtraction.
+const HOSTILE_PRICES: [i64; 6] = [i64::MIN, i64::MIN + 9_000, -1, 0, i64::MAX, 10_000_001];
+
+fn reference_of(harness: &Harness) -> Option<PriceTicks> {
+    harness
+        .core
+        .instrument(support::INSTRUMENT)
+        .unwrap()
+        .market
+        .reference_price()
+}
+
+fn feed_state_of(harness: &Harness) -> FeedState {
+    harness
+        .core
+        .instrument(support::INSTRUMENT)
+        .unwrap()
+        .market
+        .state()
+}
+
+#[test]
+fn hostile_trade_prices_never_become_the_reference() {
+    for price in HOSTILE_PRICES {
+        let mut harness = Harness::new();
+        harness.sync_feed();
+        assert_eq!(reference_of(&harness), Some(PriceTicks(100)));
+
+        harness.market(MarketEventKind::Trade {
+            aggressor: Side::Buy,
+            price: PriceTicks(price),
+            quantity: QuantityLots(1),
+        });
+        assert_eq!(feed_state_of(&harness), FeedState::Gap);
+        assert_eq!(reference_of(&harness), Some(PriceTicks(100)));
+
+        let report = last_report(harness.limit(1, 100, Side::Buy, 9_000, 1));
+        assert_eq!(
+            report.reject_reason,
+            Some(RejectReason::MarketDataUnsynchronized)
+        );
+        assert_eq!(harness.core.live_order_count(), 0);
+    }
+}
+
+#[test]
+fn hostile_prices_on_a_one_sided_book_never_become_the_reference() {
+    for price in HOSTILE_PRICES {
+        let mut harness = Harness::new();
+        harness.sync_feed();
+        // Drop the ask so the reference falls back to the last trade.
+        harness.market(MarketEventKind::LevelSet {
+            side: Side::Sell,
+            price: PriceTicks(101),
+            quantity: QuantityLots(0),
+        });
+        harness.market(MarketEventKind::Trade {
+            aggressor: Side::Buy,
+            price: PriceTicks(100),
+            quantity: QuantityLots(1),
+        });
+        assert_eq!(reference_of(&harness), Some(PriceTicks(100)));
+
+        harness.market(MarketEventKind::LevelSet {
+            side: Side::Buy,
+            price: PriceTicks(price),
+            quantity: QuantityLots(5),
+        });
+        assert_eq!(feed_state_of(&harness), FeedState::Gap);
+        assert_eq!(reference_of(&harness), Some(PriceTicks(100)));
+
+        let report = last_report(harness.limit(1, 100, Side::Buy, 9_000, 1));
+        assert_eq!(
+            report.reject_reason,
+            Some(RejectReason::MarketDataUnsynchronized)
+        );
+    }
+}
+
+#[test]
+fn hostile_snapshot_prices_never_become_the_reference() {
+    for price in HOSTILE_PRICES {
+        let mut harness = Harness::new();
+        harness.market(MarketEventKind::SnapshotBegin { snapshot_seq: 1 });
+        harness.market(MarketEventKind::SnapshotLevel {
+            side: Side::Buy,
+            price: PriceTicks(price),
+            quantity: QuantityLots(10),
+        });
+        harness.market(MarketEventKind::SnapshotEnd {
+            snapshot_seq: 1,
+            level_count: 1,
+        });
+        assert_eq!(feed_state_of(&harness), FeedState::Gap);
+        assert_eq!(reference_of(&harness), None);
+
+        let report = last_report(harness.limit(1, 100, Side::Buy, 9_000, 1));
+        assert_eq!(
+            report.reject_reason,
+            Some(RejectReason::MarketDataUnsynchronized)
+        );
+    }
+}
+
+#[test]
+fn the_collar_holds_at_the_edges_of_the_price_domain() {
+    let mut harness = Harness::new();
+    harness.market(MarketEventKind::SnapshotBegin { snapshot_seq: 1 });
+    harness.market(MarketEventKind::SnapshotLevel {
+        side: Side::Buy,
+        price: PriceTicks(10_000_000),
+        quantity: QuantityLots(10),
+    });
+    harness.market(MarketEventKind::SnapshotEnd {
+        snapshot_seq: 1,
+        level_count: 1,
+    });
+    harness.market(MarketEventKind::Trade {
+        aggressor: Side::Buy,
+        price: PriceTicks(10_000_000),
+        quantity: QuantityLots(1),
+    });
+    assert_eq!(reference_of(&harness), Some(PriceTicks(10_000_000)));
+
+    // The default collar is 5000 ticks either side of the reference.
+    let far = last_report(harness.limit(1, 100, Side::Buy, 1, 1));
+    assert_eq!(far.reject_reason, Some(RejectReason::PriceCollar));
+
+    let near = last_report(harness.limit(1, 101, Side::Buy, 9_996_000, 1));
+    assert_eq!(near.kind, ReportKind::Accepted);
+    harness.check_invariants();
+}
+
+#[test]
+fn replace_cannot_change_side() {
+    let mut harness = Harness::new();
+    harness.sync_feed();
+    harness.limit(1, 100, Side::Buy, 99, 10);
+
+    let position_before = harness.core.accounts()[0].positions[0];
+    let live_before = harness.core.live_order_count();
+
+    let report = last_report(harness.replace(1, 100, Side::Sell, 99, 10));
+    assert_eq!(report.reject_reason, Some(RejectReason::MalformedRequest));
+
+    let book = &harness.core.instrument(support::INSTRUMENT).unwrap().book;
+    let order = book.level_orders(Side::Buy, PriceTicks(99))[0];
+    assert_eq!(order.client_order_id, protocol::ClientOrderId(100));
+    assert_eq!(order.total_quantity, QuantityLots(10));
+    assert!(book.level_orders(Side::Sell, PriceTicks(99)).is_empty());
+    assert_eq!(harness.core.live_order_count(), live_before);
+    assert_eq!(harness.core.accounts()[0].positions[0], position_before);
+    harness.check_invariants();
+}
+
+#[test]
+fn replace_cannot_change_the_order_type() {
+    let mut harness = Harness::new();
+    harness.sync_feed();
+    harness.limit(1, 100, Side::Buy, 99, 10);
+
+    let position_before = harness.core.accounts()[0].positions[0];
+    let report =
+        last_report(harness.replace_as(1, 100, Side::Buy, protocol::OrderType::Market, 99, 10));
+    assert_eq!(report.reject_reason, Some(RejectReason::MalformedRequest));
+
+    let book = &harness.core.instrument(support::INSTRUMENT).unwrap().book;
+    let order = book.level_orders(Side::Buy, PriceTicks(99))[0];
+    assert_eq!(order.total_quantity, QuantityLots(10));
+    assert_eq!(harness.core.accounts()[0].positions[0], position_before);
     harness.check_invariants();
 }
 
@@ -209,7 +383,7 @@ fn replace_across_the_spread_matches_immediately() {
     harness.limit(1, 100, Side::Sell, 105, 5);
     harness.limit(2, 200, Side::Buy, 100, 5);
 
-    let events = harness.replace(2, 200, 105, 5).to_vec();
+    let events = harness.replace(2, 200, Side::Buy, 105, 5).to_vec();
     assert_eq!(trades(&events).len(), 1);
     assert_eq!(last_report(&events).kind, ReportKind::Filled);
     assert_eq!(harness.core.live_order_count(), 0);

@@ -127,32 +127,85 @@ fn order_input(ingress: u64, request_id: u64, client_seq: u64, price: i64) -> En
     }
 }
 
+/// Identifiers start above anything the warm-up consumed.
+const ID_BASE: u64 = 1_000_000;
+/// Orders per measured batch. The book holds 4096, so a fresh core per batch
+/// keeps every one of these acceptable.
+const BATCH_ORDERS: u64 = 1_000;
+
+fn batch_input(index: u64, price: i64) -> EngineInput {
+    let id = ID_BASE + index;
+    order_input(id, id, id, price)
+}
+
+/// Fails the run if the measured path is not actually accepting orders.
+fn check_accepted_batch() {
+    let mut accepted = 0u64;
+    let mut rejected = 0u64;
+    for _ in 0..5 {
+        let (mut core, mut out) = warm_core();
+        for index in 0..BATCH_ORDERS {
+            core.apply(&batch_input(index, 9_000), &mut out);
+            match out.iter().find_map(|event| match event {
+                OutputEvent::Report(report) => Some(report.reject_reason),
+                _ => None,
+            }) {
+                Some(None) => accepted += 1,
+                Some(Some(reason)) => {
+                    rejected += 1;
+                    if rejected == 1 {
+                        println!("first rejection at order {index}: {reason:?}");
+                    }
+                }
+                None => panic!("no report for order {index}"),
+            }
+        }
+    }
+    println!("accepted_new_limit validation: accepted = {accepted} rejected = {rejected}");
+    assert_eq!(rejected, 0, "the accepted benchmark must not reject");
+}
+
 fn engine(c: &mut Criterion) {
+    check_accepted_batch();
     let mut group = c.benchmark_group("engine");
+    group.throughput(criterion::Throughput::Elements(BATCH_ORDERS));
 
     group.bench_function("accepted_new_limit", |b| {
-        let (mut core, mut out) = warm_core();
-        let mut counter = 0u64;
-        b.iter(|| {
-            counter += 1;
-            let input = order_input(counter, counter, counter, 9_000);
-            core.apply(black_box(&input), &mut out);
-            black_box(out.len())
-        });
+        b.iter_batched_ref(
+            warm_core,
+            |(core, out)| {
+                let mut rejects = 0u32;
+                for index in 0..BATCH_ORDERS {
+                    core.apply(black_box(&batch_input(index, 9_000)), out);
+                    if let Some(OutputEvent::Report(report)) = out.last() {
+                        rejects += u32::from(report.reject_reason.is_some());
+                    }
+                }
+                assert_eq!(rejects, 0, "the accepted benchmark must not reject");
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     group.bench_function("rejected_risk_check", |b| {
-        let (mut core, mut out) = warm_core();
-        let mut counter = 0u64;
-        b.iter(|| {
-            counter += 1;
-            // Far outside the collar, so this exercises the reject path.
-            let input = order_input(counter, counter, counter, 1);
-            core.apply(black_box(&input), &mut out);
-            black_box(out.len())
-        });
+        b.iter_batched_ref(
+            warm_core,
+            |(core, out)| {
+                let mut accepts = 0u32;
+                for index in 0..BATCH_ORDERS {
+                    // Far outside the collar, so this exercises the reject path.
+                    core.apply(black_box(&batch_input(index, 1)), out);
+                    if let Some(OutputEvent::Report(report)) = out.last() {
+                        accepts += u32::from(report.reject_reason.is_none());
+                    }
+                }
+                assert_eq!(accepts, 0, "the rejected benchmark must not accept");
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
+    group.throughput(criterion::Throughput::Elements(10_000));
     group.bench_function("apply_generated_workload", |b| {
         let inputs = Generator::new(GeneratorConfig::new(77, 10_000)).generate();
         b.iter_batched(

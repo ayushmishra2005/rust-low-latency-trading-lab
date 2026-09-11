@@ -82,7 +82,7 @@ bounded queue, and the kill switch is a single atomic latch the engine reads bef
 | Deterministic output ordering | Each fill emits trade, maker report, then taker report, with dense monotonic output sequences |
 | Byte-exact reproducibility | BLAKE3 digests over the input stream, the output stream, and the full engine state |
 | Single-writer state | Only the engine thread mutates trading state; no mutex protects the book |
-| Nothing silently dropped | Trading requests, reports, and trades apply backpressure; only telemetry may drop, and every drop is counted |
+| Nothing silently dropped | Trading requests, reports, and trades apply backpressure; if the journal cannot record an event the engine stops and the run fails; only telemetry may drop, and every drop is counted |
 | Decoder safety | Every field is bounds-checked, frames are length- and CRC-validated, and arbitrary bytes are property-tested and fuzzed |
 
 **Order semantics.** Limit orders are good-til-cancelled and rest; market orders are bounded by a
@@ -91,7 +91,13 @@ reported normally, because this is a lab, not a venue with self-match prevention
 
 **Replace semantics.** A same-price quantity decrease keeps queue priority. A price change or a
 quantity increase loses priority. The new total may never fall below the cumulative filled
-quantity. Every check runs before any mutation, so a rejected replace leaves the order untouched.
+quantity. A replace may not change the side or the order type, and the resting order is the
+canonical source of both. Every check runs before any mutation, so a rejected replace leaves the
+order untouched.
+
+**Market data.** Feed prices are validated against the instrument price domain. A snapshot level,
+level update, or trade outside that domain puts the feed into a gap rather than becoming a
+reference price, so a hostile or corrupt feed cannot move the collar.
 
 ---
 
@@ -136,17 +142,30 @@ The engine is a pure state machine: `apply(input, logical_time, output_buffer)`.
 reads no clock, and spawns no tasks, so the same inputs always produce the same outputs and the same
 final state.
 
+There is one input stream. Market data, order requests, and control commands are sequenced at the
+point the engine applies them, not by the producers that supply them, so an operator action taken
+mid-run lands in the recorded stream in the order the engine actually saw it. Replaying that stream
+reproduces a controlled run exactly; the wall-clock moment the operator pressed the button is not
+reproduced, and does not need to be.
+
 Three digests are recorded over canonical encodings, never over memory layout, pointers, hash-map
 order, padding, or wall-clock time:
 
-- **input digest** — every normalized input the engine consumed
+- **input digest** — every input the engine applied, control commands included
 - **output digest** — every trade, execution report, and state event it produced
-- **state digest** — the full engine state: sequences, next identifiers, market view, book levels
-  with their FIFO order, and per-account positions, reservations, and limits
+- **state digest** — every piece of state that can change a future decision: sequences, next
+  identifiers, the kill latch, feed state and epoch, the last trade price, the levels of a snapshot
+  still in progress, visible market levels, book levels with their FIFO order, and per-account
+  positions, reservations, limits, and dedup entries
+
+Each variable-length section of the state encoding carries a tag and an entry count, so two
+different collection shapes cannot produce the same bytes. The encoding is versioned
+(`STATE_SCHEMA_VERSION`); the golden fixtures are regenerated whenever it changes.
 
 Periodic checkpoints make divergence cheap to locate: instead of "the run differs", you get the
 first checkpoint where the digests split. Threaded runs are verified against single-threaded replay
-in the test suite, so concurrency cannot change the result.
+in the test suite, including runs with an account disable, a risk-limit change, and kill switch
+transitions, so neither concurrency nor operator action can change the result.
 
 ---
 
@@ -169,7 +188,8 @@ so exposure is evaluated against the worst case if every resting order filled. R
 released on fill, cancel, and replace, and a test asserts they always match the live order set.
 
 The kill switch is fail-closed: it is an atomic latch the engine reads before every input, so it
-takes effect even if the control queue is saturated.
+takes effect even if the control queue is saturated. The latch is the only source of kill state, so
+engaging, releasing, and engaging again all reach the engine, and each transition is recorded once.
 
 ---
 
@@ -179,43 +199,96 @@ takes effect even if the control queue is saturated.
 > described. Re-run them yourself; they will differ on your hardware.
 
 **Environment:** Apple M5 Max, 18 logical cores, macOS 25.6.0 (aarch64), rustc 1.97.1, release
-profile.
+profile, commit `4d84465` with this pass applied. This is a development laptop, not an isolated
+measurement host.
 
 ### Microbenchmarks (Criterion, `cargo bench -p trading-core`)
 
 | Benchmark | Median | Notes |
 | --- | --- | --- |
-| `codec/decode_one_frame` | 25.8 ns | One market-data frame, bounds- and CRC-checked |
+| `codec/decode_one_frame` | 26.1 ns | One market-data frame, bounds- and CRC-checked |
 | `book/insert_1000` | 15.5 µs | 1,000 resting orders across 50 price levels |
-| `book/cancel_head` | 22.3 µs | 1,000 cancels by order id, O(1) unlink each |
-| `book/match_multi_level_sweep` | 20.5 µs | Aggressive order sweeping a 1,000-order book |
-| `engine/accepted_new_limit` | 167 ns | Full path: dedup, risk, book insert, report |
-| `engine/rejected_risk_check` | 160 ns | Full path ending in a risk rejection |
-| `engine/apply_generated_workload` | 1.48 ms | 10,000 mixed events, about 148 ns per event |
+| `book/cancel_head` | 23.5 µs | 1,000 cancels by order id, O(1) unlink each |
+| `book/match_multi_level_sweep` | 20.6 µs | Aggressive order sweeping a 1,000-order book |
+| `engine/accepted_new_limit` | 229 µs | 1,000 accepted orders on a fresh core: dedup, risk, book insert, report |
+| `engine/rejected_risk_check` | 173 µs | 1,000 orders ending in a risk rejection |
+| `engine/apply_generated_workload` | 1.50 ms | 10,000 mixed events, about 150 ns per event |
 
-### Pipeline latency (`cargo run --release -p simulator -- bench --wait busy-spin`)
+The two engine benchmarks measure batches of 1,000 orders against a freshly prepared core, because
+a single long-lived core fills its 4,096-order capacity and starts rejecting. Each batch asserts
+that every order took the intended path, and the bench binary prints an acceptance check before
+Criterion measures anything.
 
-Order-to-report latency across three threads and two bounded SPSC queues, measured with an
-independent monotonic schedule so a stall shows up as reduced throughput rather than reduced
-offered load.
+### Engine pipeline latency (`cargo run --release -p simulator -- bench --wait busy-spin --runs 5`)
 
-| Offered load | p50 | p95 | p99 | p99.9 | max | Throughput |
+**Boundary:** feed thread → bounded SPSC queue → engine → output thread. No journal, no snapshots,
+no control API, no settlement. Two start points are measured separately and never combined:
+
+- **scheduled-arrival-to-report** starts at the instant the input was due on the offered schedule,
+  so it includes any time the producer spent behind that schedule
+- **enqueue-to-report** starts when the producer actually handed the input over, so it excludes
+  producer scheduling debt
+
+Each offered rate is run six times: one warm-up run that is not published, then five measured runs.
+The tables give the median across the five runs, with the lowest and highest run in brackets, so the
+run-to-run spread is visible. These are not confidence intervals. Every individual run is printed by
+the command above. Workload: 200,000 generated events, 252,024 measured order reports per run,
+`busy-spin` wait strategy, 4,096-entry queues.
+
+**scheduled-arrival-to-report**
+
+| Offered load | p50 | p99 | p99.9 | max | Throughput | Generator behind |
 | --- | --- | --- | --- | --- | --- | --- |
-| 100,000 msg/s | 750 ns | 1.54 µs | 4.17 µs | 24.8 µs | 67.3 µs | 99,998 msg/s |
-| 500,000 msg/s | 708 ns | 1.46 µs | 7.17 µs | 30.6 µs | 58.8 µs | 499,958 msg/s |
-| unpaced | 1.07 ms | 1.14 ms | 1.16 ms | 1.18 ms | 1.18 ms | 3,834,229 msg/s |
+| 100,000 msg/s | 750 ns [708–750] | 6.75 µs [6.58–7.17] | 30.3 µs [28.5–35.4] | 66.0 µs [56.9–91.6] | 99,998 msg/s | 331 of 200,000 |
+| 500,000 msg/s | 666 ns [666–667] | 8.71 µs [7.25–9.09] | 42.0 µs [36.7–44.6] | 87.0 µs [71.0–94.8] | 499,961 msg/s | 1,263 of 200,000 |
+| unpaced | 1.04 ms [1.02–1.05] | 1.21 ms [1.14–1.23] | 1.23 ms [1.16–1.29] | 1.23 ms [1.16–1.30] | 3,922,315 msg/s | 0 |
+
+**enqueue-to-report**
+
+| Offered load | p50 | p99 | p99.9 | max |
+| --- | --- | --- | --- | --- |
+| 100,000 msg/s | 709 ns [708–750] | 4.54 µs [4.42–4.71] | 27.0 µs [24.9–30.1] | 66.0 µs [55.9–84.5] |
+| 500,000 msg/s | 666 ns [666–667] | 5.63 µs [4.63–6.13] | 37.1 µs [29.8–39.8] | 79.4 µs [62.8–94.6] |
+| unpaced | 1.04 ms [1.02–1.05] | 1.21 ms [1.14–1.23] | 1.23 ms [1.16–1.29] | 1.23 ms [1.16–1.30] |
+
+The gap between the two tables is the producer falling behind its own schedule: at 500,000 msg/s the
+generator missed its slot 1,263 times, which moves p99 from 5.63 µs to 8.71 µs. Unpaced has no
+schedule, so the two boundaries are identical there.
 
 The unpaced row is deliberately included: with an infinite offered load the queue stays full, so the
 measurement becomes queue residence, not coordination latency. That is why latency is only quoted at
 a stated offered load.
 
-### Queue coordination (ping-pong over two SPSC queues, 100,000 samples)
+**These are development benchmarks taken on a macOS laptop, not isolated production-host latency
+claims.** There is no core pinning, no isolated CPU set, no interrupt steering, and other processes
+were running. Tail percentiles in particular should be read as "what this laptop did five times in a
+row", not as a platform guarantee.
+
+### Runtime with journal (same command)
+
+**Boundary:** the shipped `run()` path — canonical input recording and digests, the CRC-framed
+journal, snapshots every 1,000 engine sequences, and the same queue and runtime code the pipeline
+uses. Solana, Canton, Node, and external settlement are excluded. This path carries no per-event
+wall-clock stamp, so only whole-run throughput is reported, not latency percentiles. Workload: 5,000
+generated events producing 5,261 inputs and 7,107 journal records; five measured runs each.
+
+| Journal mode | Throughput (median of 5) | Range | What it guarantees |
+| --- | --- | --- | --- |
+| `Buffered` | 1,091,786 msg/s | 618,522 – 1,095,746 | Flush when the buffer fills or the run ends |
+| `GroupCommit(64)` | 1,065,734 msg/s | 1,020,389 – 1,068,367 | Visible within 64 records or on queue drain, no `fsync` |
+| `Durable` | 228 msg/s | 226 – 228 | `fsync` per output event |
+
+Durable acknowledgement costs roughly four thousand times the throughput of group commit on this
+laptop's filesystem. That is the honest price of one `fsync` per event, and it is why the gateway
+uses group commit and states that it is a visibility bound rather than a durability one.
+
+### Queue coordination (ping-pong over two SPSC queues, 100,000 samples, one run)
 
 | Wait strategy | p50 | p99 | p99.9 |
 | --- | --- | --- | --- |
-| busy spin | 250 ns | 334 ns | 542 ns |
-| adaptive | 292 ns | 375 ns | 666 ns |
-| sleep | 67.6 µs | 141 µs | 145 µs |
+| busy spin | 250 ns | 333 ns | 542 ns |
+| adaptive | 292 ns | 416 ns | 5.38 µs |
+| sleep | 80.0 µs | 166 µs | 171 µs |
 
 The wait strategy dominates end-to-end latency at low load: an engine thread that parked wakes tens
 of microseconds late. Busy spin buys latency with a core, which is the trade a real venue makes.
@@ -230,8 +303,34 @@ Two processes sit between an operator and the engine, and neither can slow it do
 carries a schema version and a command id, frames are bounded before parsing, and each response
 reports the engine sequence it was answered at. All 64- and 128-bit values cross the boundary as
 decimal strings, because JavaScript numbers cannot represent them exactly. Reads come from the
-durable journal and from periodic engine snapshots; mutations require a shared token and are
-refused outright when no token is configured.
+journal and from periodic engine snapshots; mutations require a shared token and are refused
+outright when no token is configured.
+
+**Journal visibility and durability are different things, and the code keeps them apart.** The
+output thread writes CRC-framed records through a buffer, and `JournalSync` chooses when that buffer
+is pushed:
+
+| Mode | Contract |
+| --- | --- |
+| `Buffered` | The buffer is flushed when it fills and at the end of the run. Cheapest; a reader may not see recent records. |
+| `GroupCommit(n)` | The buffer is flushed after at most `n` records and whenever the output queue drains, so a reader sees every record within that bound. This is visibility, not durability: there is no `fsync`. |
+| `Durable` | Every record is flushed and `fsync`ed before the next one is written. Visible and durable, at one `fsync` per output event. |
+
+The gateway runs `GroupCommit`, because it tails the journal and must not be reading a buffer that
+may never be published. Engine acknowledgement — the engine applied the input and emitted output —
+happens earlier and is a separate fact from either of these. If a journal write fails, the engine
+stops rather than continuing without a record.
+
+**Snapshots are bounded by depth, not by book size.** The engine publishes a read model at a
+configured interval, on the trading thread, so capture reads at most the top `depth` levels per side
+and `depth * 8` orders per instrument. It iterates the ordered structures directly: the book is never
+cloned and then truncated. A test measures capture against a 100-order book and a 4,000-order book at
+the same depth and asserts the cost does not follow the live order count.
+
+The tail reader is incremental: it holds a file positioned at the last committed offset, reads only
+bytes appended since the previous poll, holds an incomplete trailing record until the writer
+finishes it, and reports corruption at the offset where it occurred. Gateway requests that touch the
+filesystem run on a blocking Tokio task rather than on a reactor worker.
 
 **TypeScript control API.** Fastify with strict TypeScript and JSON Schema validation on every
 request. It tails the gateway, applies the output stream to a SQLite projection, and serves:
@@ -261,7 +360,9 @@ settlement is delayed, unknown, or retried.**
 
 The projection groups unsettled trades into batches in a SQLite outbox. Each batch gets a settlement
 identity derived from its trade range and a canonical manifest hash over its contents. Retries reuse
-both, so a timeout can never create a second economic identity.
+both, so a timeout can never create a second economic identity. That manifest hash is the outbox's
+own record of the batch; each venue additionally binds its settlement to the economics it actually
+applies, in the way that venue can prove — see below.
 
 ```
 pending ──▶ submitted ──▶ confirmed        (terminal)
@@ -277,11 +378,28 @@ A minimal Anchor program holds collateral in PDA-isolated accounts and applies b
 `initialize_exchange`, `open_collateral`, `deposit_collateral`, `withdraw_collateral`,
 `freeze_account`, and `settle_batch`. It validates signers, PDA seeds, account ownership, the mint
 and token program, the exchange authority, and every amount, and uses checked arithmetic throughout.
+Before a batch mutates anything it checks each supplied collateral account: writable, unique by
+public key, owned by this exchange, and at its canonical PDA address. That closes the classic
+duplicate-mutable-account hole where the same account appears twice in one batch and one leg
+overwrites another.
+
+**The manifest hash is proved on chain, not trusted.** There is one canonical binary encoding of a
+batch: a 16-byte domain tag `RLTL-SETTLE-V1  `, the 16-byte settlement id, the 32-byte exchange key,
+the leg count as `u16` little-endian, then each leg in order as payer collateral key (32 bytes),
+payee collateral key (32 bytes), amount as `u64` little-endian. Note that a leg is identified by the
+collateral account key, never by its index into the remaining accounts. The program resolves every
+leg, hashes that preimage with sha256, and rejects the batch with `ManifestMismatch` unless the
+result equals the supplied hash — before any balance moves. The TypeScript client builds the same
+bytes with node's built-in `crypto`, and a golden vector (two legs, 210-byte preimage, hash
+`d11c5555…`) is asserted from both Rust and TypeScript, so the two encoders cannot drift apart.
+Changing an amount, swapping a payer or payee, or reordering the legs while keeping the old hash is
+rejected, and each of those is a test.
 
 Idempotency comes from a receipt PDA keyed by the settlement identity: submitting the same identity
-twice fails, and the client resolves the outcome by reading the receipt. A different manifest under
-the same identity is refused. The program targets the classic SPL Token program; broad Token-2022
-support is not implemented or claimed. Tests run against a local validator, never a public RPC.
+twice fails, and the client resolves the outcome by reading the receipt. Different economics under
+the same identity are refused, whether or not the hash matches them. The program targets the classic
+SPL Token program; broad Token-2022 support is not implemented or claimed. Tests run against a local
+validator, never a public RPC.
 
 ### 🔐 Canton
 
@@ -289,6 +407,19 @@ A Daml settlement workflow models the smallest useful flow: an operator proposes
 `SettlementInstruction` covering one or more legs, every affected party accepts, and `Settle` applies
 all legs atomically and creates a `SettlementReceipt` keyed by the settlement identity. Duplicate
 identities, partial acceptance, and insufficient holdings are all rejected by the ledger.
+
+**The receipt records what was settled, rather than a string the client supplied.** `Settle` takes
+the legs the caller believes it is settling and refuses to run unless they match the instruction,
+leg for leg and count included. The receipt then stores the applied legs, their count, and a
+canonical text encoding — `settlementId|legCount|payer>payee:amount|…` — that the ledger derives
+from those legs. It is a deterministic encoding, not a cryptographic hash: Daml SDK 2.10.6 exposes no
+sha256 to contract code, and the off-chain manifest covers trade ids, instrument, price ticks, and
+quantities that the ledger never receives, so recomputing the client's digest on the ledger is not
+possible and is not pretended. Reconciliation therefore compares stored economics, not a copied
+string. Changing an amount or a participant under the same identity is rejected, and an exact
+duplicate stays idempotent. What this does not prove: nothing on the ledger links the netted legs
+back to the individual trades, so a client that nets the wrong trades into well-formed legs would
+still settle.
 
 The `Holding` template is an explicit lab placeholder for a real holding, not a token standard
 implementation: the Canton Network Token Standard packages are not deployed on a plain sandbox, so
@@ -314,7 +445,12 @@ What the suite actually checks:
 - **Golden fixtures** — recorded feeds with recorded digests, so an accidental behaviour change fails
   loudly instead of silently
 - **Decoder hardening** — arbitrary bytes, every truncated prefix, and single-bit flips are property
-  tested; three `cargo-fuzz` targets cover the frame, header, and output decoders
+  tested; four `cargo-fuzz` targets cover the frame, header, and output decoders. Random mutation
+  almost never produces a correct CRC, so the raw frame target rarely gets past framing; a fourth
+  target normalizes only the length, reserved flags, schema version, and checksum, leaving the
+  message type, header fields, and payload to the fuzzer, so payload parsing is actually reachable.
+  Nothing in the decoder is bypassed or reimplemented, and a unit test proves a real frame body
+  survives that wrapper and decodes
 - **Threaded equivalence** — a three-thread run must reproduce the single-threaded replay digests
 - **Invariants** — reservations match live orders, positions net to zero, cumulative fills never
   exceed the accepted total, output sequences never skip

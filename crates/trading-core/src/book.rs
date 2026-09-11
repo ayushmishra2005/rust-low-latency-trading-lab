@@ -250,6 +250,45 @@ impl OrderBook {
         }
     }
 
+    /// Best `limit` levels on one side. Work is bounded by `limit`, not by the
+    /// number of levels in the book.
+    pub fn top_levels(&self, side: Side, limit: usize) -> Vec<(PriceTicks, PriceLevel)> {
+        match side {
+            Side::Buy => self
+                .bids
+                .iter()
+                .rev()
+                .take(limit)
+                .map(|(p, l)| (*p, *l))
+                .collect(),
+            Side::Sell => self
+                .asks
+                .iter()
+                .take(limit)
+                .map(|(p, l)| (*p, *l))
+                .collect(),
+        }
+    }
+
+    /// First `limit` orders at one price, in FIFO priority order.
+    pub fn level_orders_upto(&self, side: Side, price: PriceTicks, limit: usize) -> Vec<OrderNode> {
+        let levels = match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        };
+        let mut out = Vec::new();
+        let mut cursor = levels.get(&price).and_then(|level| level.head);
+        while let Some(slot) = cursor {
+            if out.len() >= limit {
+                break;
+            }
+            let node = self.orders[slot];
+            out.push(node);
+            cursor = node.next;
+        }
+        out
+    }
+
     /// Orders at one price in FIFO priority order.
     pub fn level_orders(&self, side: Side, price: PriceTicks) -> Vec<OrderNode> {
         let levels = match side {

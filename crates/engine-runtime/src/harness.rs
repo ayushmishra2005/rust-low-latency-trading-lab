@@ -5,7 +5,6 @@
 //! schedules against an independent monotonic timeline so a stall reduces
 //! observed throughput instead of quietly reducing offered load.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -98,14 +97,47 @@ pub fn queue_round_trip(samples: usize, wait: WaitStrategy) -> LatencyStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineBench {
-    pub order_to_report: LatencyStats,
+    /// Scheduled arrival to report. Includes time the producer spent behind
+    /// its own schedule, so a slow producer shows up here.
+    pub arrival_to_report: LatencyStats,
+    /// Actual enqueue to report. Excludes producer scheduling debt.
+    pub enqueue_to_report: LatencyStats,
     pub inputs: u64,
     pub outputs: u64,
     pub elapsed_ns: u128,
+    pub offered_rate_hz: u64,
     /// Times the generator could not keep up with the requested schedule.
     pub generator_behind: u64,
     pub input_high_water: u64,
     pub output_high_water: u64,
+}
+
+/// One benchmark run. `producer_delay_ns` is a deliberate producer stall used
+/// to prove the two latency boundaries measure different things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BenchConfig {
+    pub capacity: usize,
+    pub wait: WaitStrategy,
+    pub target_rate_hz: u64,
+    pub producer_delay_ns: u64,
+}
+
+impl BenchConfig {
+    pub fn new(capacity: usize, wait: WaitStrategy, target_rate_hz: u64) -> BenchConfig {
+        BenchConfig {
+            capacity,
+            wait,
+            target_rate_hz,
+            producer_delay_ns: 0,
+        }
+    }
+}
+
+/// Arrival schedule and actual enqueue instant of one input.
+#[derive(Debug, Clone, Copy)]
+struct Stamp {
+    scheduled_ns: u64,
+    enqueue_ns: u64,
 }
 
 impl PipelineBench {
@@ -117,27 +149,25 @@ impl PipelineBench {
     }
 }
 
-/// Measures order-to-report latency at a requested offered load.
+/// Measures the lightweight engine pipeline: feed thread, bounded queue,
+/// engine, output thread. No journal, no snapshots, no control API.
 ///
-/// `target_rate_hz` of zero means "as fast as possible".
+/// Two boundaries are reported. Scheduled-arrival-to-report starts at the
+/// instant the input was due; enqueue-to-report starts when the producer
+/// actually handed it over. `target_rate_hz` of zero means "as fast as possible".
 pub fn open_loop_pipeline(
     engine_config: EngineConfig,
     inputs: Vec<EngineInput>,
-    capacity: usize,
-    wait: WaitStrategy,
-    target_rate_hz: u64,
+    config: BenchConfig,
 ) -> PipelineBench {
-    let (mut input_tx, mut input_rx) = bounded::<(EngineInput, u64)>(capacity, wait);
-    let (mut output_tx, mut output_rx) = bounded::<(OutputEvent, u64)>(capacity, wait);
+    let capacity = config.capacity;
+    let wait = config.wait;
+    let (mut input_tx, mut input_rx) = bounded::<(EngineInput, Stamp)>(capacity, wait);
+    let (mut output_tx, mut output_rx) = bounded::<(OutputEvent, Stamp)>(capacity, wait);
     let input_stats = input_tx.stats();
     let output_stats = output_tx.stats();
 
     // Engine sequence maps one-to-one onto scheduled inputs in this harness.
-    let send_times: Arc<Vec<AtomicU64>> = Arc::new(
-        (0..inputs.len() + 1)
-            .map(|_| AtomicU64::new(0))
-            .collect::<Vec<_>>(),
-    );
     let order_inputs: Arc<Vec<bool>> = Arc::new(
         std::iter::once(false)
             .chain(
@@ -149,25 +179,26 @@ pub fn open_loop_pipeline(
     );
 
     let start = Instant::now();
-    let feed_times = Arc::clone(&send_times);
-    let total = inputs.len();
+    let target_rate_hz = config.target_rate_hz;
+    let producer_delay_ns = config.producer_delay_ns;
     let feed = std::thread::Builder::new()
         .name("bench-feed".to_string())
         .spawn(move || {
             let interval_ns = 1_000_000_000u64.checked_div(target_rate_hz).unwrap_or(0);
             let mut behind = 0u64;
             for (index, input) in inputs.into_iter().enumerate() {
+                let mut scheduled_ns = start.elapsed().as_nanos() as u64;
                 if interval_ns > 0 {
-                    let scheduled = (index as u64 + 1) * interval_ns;
+                    scheduled_ns = (index as u64 + 1) * interval_ns;
                     loop {
                         let now = start.elapsed().as_nanos() as u64;
-                        if now >= scheduled {
-                            if now > scheduled + interval_ns {
+                        if now >= scheduled_ns {
+                            if now > scheduled_ns + interval_ns {
                                 behind += 1;
                             }
                             break;
                         }
-                        let remaining = scheduled - now;
+                        let remaining = scheduled_ns - now;
                         if remaining > 50_000 {
                             std::thread::sleep(Duration::from_nanos(remaining - 20_000));
                         } else {
@@ -175,9 +206,15 @@ pub fn open_loop_pipeline(
                         }
                     }
                 }
+                if producer_delay_ns > 0 {
+                    std::thread::sleep(Duration::from_nanos(producer_delay_ns));
+                }
                 let enqueue_ns = start.elapsed().as_nanos() as u64;
-                feed_times[index + 1].store(enqueue_ns, Ordering::Relaxed);
-                if !input_tx.send((input, enqueue_ns)) {
+                let stamp = Stamp {
+                    scheduled_ns,
+                    enqueue_ns,
+                };
+                if !input_tx.send((input, stamp)) {
                     break;
                 }
             }
@@ -191,11 +228,11 @@ pub fn open_loop_pipeline(
             let mut core = TradingCore::new(engine_config);
             let mut batch = Vec::with_capacity(64);
             let mut applied = 0u64;
-            while let Some((input, enqueue_ns)) = input_rx.recv() {
+            while let Some((input, stamp)) = input_rx.recv() {
                 core.apply(&input, &mut batch);
                 applied += 1;
                 for event in &batch {
-                    if !output_tx.send((*event, enqueue_ns)) {
+                    if !output_tx.send((*event, stamp)) {
                         break;
                     }
                 }
@@ -204,38 +241,43 @@ pub fn open_loop_pipeline(
         })
         .expect("bench engine thread");
 
-    let report_times = Arc::clone(&send_times);
     let output = std::thread::Builder::new()
         .name("bench-output".to_string())
         .spawn(move || {
-            let mut histogram = histogram();
+            let mut arrival = histogram();
+            let mut enqueue = histogram();
             let mut outputs = 0u64;
-            while let Some((event, enqueue_ns)) = output_rx.recv() {
+            while let Some((event, stamp)) = output_rx.recv() {
                 outputs += 1;
                 if let OutputEvent::Report(report) = event {
                     let index = report.engine_seq.0 as usize;
                     if index < order_inputs.len() && order_inputs[index] {
                         let now = start.elapsed().as_nanos() as u64;
-                        let sent = report_times[index].load(Ordering::Relaxed).max(enqueue_ns);
-                        histogram.record(now.saturating_sub(sent).max(1)).ok();
+                        arrival
+                            .record(now.saturating_sub(stamp.scheduled_ns).max(1))
+                            .ok();
+                        enqueue
+                            .record(now.saturating_sub(stamp.enqueue_ns).max(1))
+                            .ok();
                     }
                 }
             }
-            (histogram, outputs)
+            (arrival, enqueue, outputs)
         })
         .expect("bench output thread");
 
     let generator_behind = feed.join().expect("bench feed");
     let applied = engine.join().expect("bench engine");
-    let (histogram, outputs) = output.join().expect("bench output");
+    let (arrival, enqueue, outputs) = output.join().expect("bench output");
     let elapsed_ns = start.elapsed().as_nanos();
-    let _ = total;
 
     PipelineBench {
-        order_to_report: LatencyStats::from(&histogram),
+        arrival_to_report: LatencyStats::from(&arrival),
+        enqueue_to_report: LatencyStats::from(&enqueue),
         inputs: applied,
         outputs,
         elapsed_ns,
+        offered_rate_hz: target_rate_hz,
         generator_behind,
         input_high_water: input_stats.high_water(),
         output_high_water: output_stats.high_water(),

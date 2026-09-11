@@ -45,6 +45,7 @@ fn run_engine(fixture: &Fixture, events: usize) {
         EngineConfig::single_instrument(9),
         PipelineConfig {
             journal_path: Some(fixture.journal.clone()),
+            journal_sync: engine_runtime::JournalSync::GroupCommit(64),
             snapshot_interval: 100,
             snapshot_depth: 8,
             ..PipelineConfig::default()

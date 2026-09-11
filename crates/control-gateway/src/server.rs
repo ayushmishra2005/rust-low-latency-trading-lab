@@ -51,7 +51,13 @@ async fn handle(mut stream: UnixStream, gateway: Arc<Gateway>) -> std::io::Resul
         stream.read_exact(&mut body).await?;
 
         let mut response = match serde_json::from_slice::<Request>(&body) {
-            Ok(request) => dispatch(&gateway, request),
+            // Journal reads and replay jobs block, so keep them off the reactor.
+            Ok(request) => {
+                let gateway = Arc::clone(&gateway);
+                tokio::task::spawn_blocking(move || dispatch(&gateway, request))
+                    .await
+                    .expect("dispatch task")
+            }
             Err(error) => Response::failed(
                 "unknown",
                 "bad_request",

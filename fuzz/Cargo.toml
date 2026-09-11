@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+crc32fast = "1"
 protocol = { path = "../crates/protocol" }
 
 [[bin]]
@@ -28,6 +29,13 @@ bench = false
 [[bin]]
 name = "decode_output"
 path = "fuzz_targets/decode_output.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_frame_body"
+path = "fuzz_targets/decode_frame_body.rs"
 test = false
 doc = false
 bench = false

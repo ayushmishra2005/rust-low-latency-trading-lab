@@ -13,6 +13,9 @@ export type SubmitOutcome =
 export interface SettlementAdapter {
   readonly venue: string;
   submit(manifest: Manifest, manifestHash: string): Promise<SubmitOutcome>;
-  /** Re-checks a settlement whose outcome is unknown. */
-  lookup(settlementId: string, manifestHash: string): Promise<SubmitOutcome>;
+  /**
+   * Re-checks a settlement whose outcome is unknown. The manifest is passed so
+   * a venue that records economics can reconcile against them.
+   */
+  lookup(settlementId: string, manifestHash: string, manifest?: Manifest): Promise<SubmitOutcome>;
 }

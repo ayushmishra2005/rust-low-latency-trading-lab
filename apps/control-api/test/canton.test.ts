@@ -143,11 +143,13 @@ test('resubmitting the same identity resolves to the recorded receipt', { skip: 
   db.close();
 });
 
-test('the same identity with a different manifest is refused', { skip: !enabled }, async () => {
+test('the same identity with different economics is refused', { skip: !enabled }, async () => {
   const { db, outbox } = newOutbox('conflict', 3);
   outbox.createBatch(10);
   const settlementId = settlementIdFor('canton', 1n, 3n);
   const manifest = outbox.manifestFor(settlementId);
+  // Same settlement identity, larger amount than the ledger settled.
+  manifest.trades[0]!.quantityLots = '50';
 
   const outcome = await venue.submit(manifest, 'ab'.repeat(32));
   assert.equal(outcome.kind, 'rejected');

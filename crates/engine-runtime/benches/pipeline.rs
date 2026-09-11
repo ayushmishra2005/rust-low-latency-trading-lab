@@ -3,7 +3,7 @@
 //! Criterion is not used here because these measurements are multi-thread and
 //! externally paced. Run with `cargo bench -p engine-runtime`.
 
-use engine_runtime::harness::{open_loop_pipeline, queue_round_trip};
+use engine_runtime::harness::{open_loop_pipeline, queue_round_trip, BenchConfig};
 use engine_runtime::WaitStrategy;
 use trading_core::{EngineConfig, Generator, GeneratorConfig};
 
@@ -26,15 +26,15 @@ fn main() {
     }
 
     println!();
-    println!("== open-loop pipeline order-to-report ==");
+    // Engine pipeline only: no journal, no snapshots, no control API.
+    // The simulator bench command publishes the multi-run numbers.
+    println!("== engine pipeline latency ==");
     let inputs = Generator::new(GeneratorConfig::new(2_026, events)).generate();
     for rate in [0u64, 100_000, 500_000] {
         let result = open_loop_pipeline(
             EngineConfig::single_instrument(1),
             inputs.clone(),
-            4_096,
-            WaitStrategy::default(),
-            rate,
+            BenchConfig::new(4_096, WaitStrategy::default(), rate),
         );
         let label = if rate == 0 {
             "unpaced".to_string()
@@ -42,9 +42,16 @@ fn main() {
             format!("{rate}/s")
         };
         println!(
-            "offered={:<9} {} | {:.0} msg/s | behind={} | in_hw={} out_hw={}",
+            "offered={:<9} scheduled-arrival-to-report {}",
+            label, result.arrival_to_report
+        );
+        println!(
+            "offered={:<9} enqueue-to-report           {}",
+            label, result.enqueue_to_report
+        );
+        println!(
+            "offered={:<9} {:.0} msg/s | behind={} | in_hw={} out_hw={}",
             label,
-            result.order_to_report,
             result.messages_per_second(),
             result.generator_behind,
             result.input_high_water,

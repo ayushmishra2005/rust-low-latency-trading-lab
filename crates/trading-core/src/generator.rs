@@ -55,6 +55,7 @@ impl GeneratorConfig {
 struct LiveClientOrder {
     account_slot: usize,
     client_order_id: ClientOrderId,
+    side: Side,
     price: PriceTicks,
     quantity: u64,
 }
@@ -313,6 +314,8 @@ impl Generator {
                 self.client_seq[target.account_slot]
             };
             request.target_client_order_id = target.client_order_id;
+            // A replace keeps the side and type of the resting order.
+            request.side = target.side;
             request.price = target.price;
             let new_total = 1 + self.rng.below(target.quantity.max(1) + 5);
             request.quantity = QuantityLots(new_total);
@@ -343,6 +346,7 @@ impl Generator {
                     self.live.push(LiveClientOrder {
                         account_slot,
                         client_order_id,
+                        side,
                         price: request.price,
                         quantity,
                     });

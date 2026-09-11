@@ -20,6 +20,15 @@ interface Leg {
   amount: string;
 }
 
+interface ReceiptRecord {
+  contractId: string;
+  payload: {
+    legs: Leg[];
+    legCount: string;
+    economics: string;
+  };
+}
+
 interface JsonApiResult<T> {
   status: number;
   result?: T;
@@ -27,11 +36,22 @@ interface JsonApiResult<T> {
 }
 
 /**
+ * Deterministic text encoding of the economics of one settlement, matching
+ * `canonicalEconomics` in the Daml model. It is a canonical encoding, not a
+ * cryptographic hash.
+ */
+export function canonicalEconomics(settlementId: string, legs: Leg[]): string {
+  const encoded = legs.map((leg) => `${leg.payer}>${leg.payee}:${leg.amount}`);
+  return [settlementId, String(legs.length), ...encoded].join('|');
+}
+
+/**
  * Settles batches through the Daml settlement workflow.
  *
  * Canton is a settlement boundary, never part of execution. The workflow keys a
  * receipt by the settlement identity, so a resubmission after a timeout is
- * recognised instead of paying twice.
+ * recognised instead of paying twice. The receipt stores the legs that were
+ * applied, so reconciliation compares actual economics.
  */
 export class CantonVenue implements SettlementAdapter {
   readonly venue = 'canton';
@@ -42,7 +62,7 @@ export class CantonVenue implements SettlementAdapter {
   }
 
   async submit(manifest: Manifest, manifestHash: string): Promise<SubmitOutcome> {
-    const existing = await this.lookup(manifest.settlementId, manifestHash);
+    const existing = await this.lookup(manifest.settlementId, manifestHash, manifest);
     if (existing.kind !== 'notFound') {
       return existing;
     }
@@ -62,7 +82,6 @@ export class CantonVenue implements SettlementAdapter {
         payload: {
           operator: this.options.operator,
           settlementId: manifest.settlementId,
-          manifestHash,
           legs,
           accepted: [],
         },
@@ -87,7 +106,8 @@ export class CantonVenue implements SettlementAdapter {
         templateId: this.templateId('SettlementInstruction'),
         contractId: instruction,
         choice: 'Settle',
-        argument: {},
+        // The ledger settles only if these are the legs on the instruction.
+        argument: { expectedLegs: legs, expectedLegCount: String(legs.length) },
         meta: { actAs: [this.options.operator] },
       });
       return { kind: 'confirmed', receipt: settled.exerciseResult };
@@ -102,16 +122,17 @@ export class CantonVenue implements SettlementAdapter {
     }
   }
 
-  async lookup(settlementId: string, manifestHash: string): Promise<SubmitOutcome> {
+  async lookup(
+    settlementId: string,
+    _manifestHash: string,
+    manifest?: Manifest,
+  ): Promise<SubmitOutcome> {
     let receipts;
     try {
-      receipts = await this.post<{ contractId: string; payload: { manifestHash: string } }[]>(
-        '/v1/query',
-        {
-          templateIds: [this.templateId('SettlementReceipt')],
-          query: { operator: this.options.operator, settlementId },
-        },
-      );
+      receipts = await this.post<ReceiptRecord[]>('/v1/query', {
+        templateIds: [this.templateId('SettlementReceipt')],
+        query: { operator: this.options.operator, settlementId },
+      });
     } catch (error) {
       return this.classify(error, 'unknown');
     }
@@ -119,8 +140,26 @@ export class CantonVenue implements SettlementAdapter {
     if (receipt === undefined) {
       return { kind: 'notFound' };
     }
-    if (receipt.payload.manifestHash !== manifestHash) {
-      return { kind: 'rejected', reason: 'ledger receipt has a different manifest hash' };
+    if (manifest === undefined) {
+      return { kind: 'unknown', reason: 'reconciliation needs the manifest to compare economics' };
+    }
+
+    // Compare the economics the ledger recorded with the economics of this batch.
+    let expected: string;
+    try {
+      expected = canonicalEconomics(settlementId, this.buildLegs(manifest).legs);
+    } catch (error) {
+      return { kind: 'rejected', reason: message(error) };
+    }
+    const recorded = canonicalEconomics(settlementId, receipt.payload.legs);
+    if (
+      receipt.payload.legCount !== String(receipt.payload.legs.length) ||
+      recorded !== receipt.payload.economics
+    ) {
+      return { kind: 'rejected', reason: 'ledger receipt economics do not match its own legs' };
+    }
+    if (recorded !== expected) {
+      return { kind: 'rejected', reason: 'ledger receipt settled different economics' };
     }
     return { kind: 'alreadyApplied', receipt: receipt.contractId };
   }
@@ -147,7 +186,11 @@ export class CantonVenue implements SettlementAdapter {
     if (/DUPLICATE|already exists|UniqueKeyViolation/i.test(text)) {
       return { kind: 'unknown', reason: text };
     }
-    if (/insufficient|must accept|not part of this settlement|positive|pay itself/i.test(text)) {
+    if (
+      /insufficient|must accept|not part of this settlement|positive|pay itself|do(es)? not match/i.test(
+        text,
+      )
+    ) {
       return { kind: 'rejected', reason: text };
     }
     return fallback === 'unknown' ? { kind: 'unknown', reason: text } : { kind: 'rejected', reason: text };

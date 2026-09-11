@@ -16,7 +16,8 @@ use trading_core::{EngineConfig, Generator, GeneratorConfig, Replay, TradingCore
 
 pub struct Gateway {
     control: ControlHandle,
-    tail: Mutex<JournalTail>,
+    /// Opened on the first read: the journal may not exist yet at startup.
+    tail: Mutex<Option<JournalTail>>,
     journal_path: PathBuf,
     latest_snapshot: Mutex<Option<EngineSnapshot>>,
     token: Option<String>,
@@ -31,7 +32,7 @@ impl Gateway {
     pub fn new(control: ControlHandle, journal_path: PathBuf, token: Option<String>) -> Gateway {
         Gateway {
             control,
-            tail: Mutex::new(JournalTail::open(&journal_path)),
+            tail: Mutex::new(None),
             journal_path,
             latest_snapshot: Mutex::new(None),
             token,
@@ -81,7 +82,11 @@ impl Gateway {
     }
 
     pub fn next_outputs(&self, limit: usize) -> Result<Vec<OutputEvent>, String> {
-        let mut tail = self.tail.lock().expect("tail mutex");
+        let mut guard = self.tail.lock().expect("tail mutex");
+        if guard.is_none() {
+            *guard = Some(JournalTail::open(&self.journal_path).map_err(|e| e.to_string())?);
+        }
+        let tail = guard.as_mut().expect("tail is open");
         match tail.poll(limit) {
             Ok(events) => {
                 self.delivered_outputs
@@ -127,13 +132,15 @@ impl Gateway {
         })
     }
 
+    /// The latch is the single source of truth, so the engine sees both engage
+    /// and release even when the command queue is saturated.
     pub fn engage_kill(&self, engaged: bool) -> Result<(), String> {
         if engaged {
-            // Fail-closed latch: the engine observes it before the queue drains.
             self.control.engage_kill();
-            return Ok(());
+        } else {
+            self.control.release_kill();
         }
-        self.submit(ControlCommand::SetGlobalKill { engaged: false })
+        Ok(())
     }
 
     pub fn set_account_enabled(&self, account: u32, enabled: bool) -> Result<(), String> {

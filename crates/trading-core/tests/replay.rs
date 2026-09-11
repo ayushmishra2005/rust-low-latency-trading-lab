@@ -15,6 +15,90 @@ fn run(seed: u64, events: usize) -> (Replay, Vec<OutputEvent>) {
     (replay, collected)
 }
 
+/// Applies market events to a fresh core and returns its state digest.
+fn market_state_digest(kinds: &[protocol::MarketEventKind]) -> [u8; 32] {
+    use protocol::{EngineInput, IngressSeq, InputEvent, InstrumentId, MarketEvent};
+
+    let mut core = TradingCore::new(EngineConfig::single_instrument(9));
+    let mut out = Vec::new();
+    for (index, kind) in kinds.iter().enumerate() {
+        let seq = index as u64 + 1;
+        let input = EngineInput {
+            ingress_seq: IngressSeq(seq),
+            recv_time_ns: seq * 1_000,
+            event: InputEvent::Market(MarketEvent {
+                instrument: InstrumentId(1),
+                source_seq: seq,
+                source_time_ns: seq * 1_000,
+                kind: *kind,
+            }),
+        };
+        core.apply(&input, &mut out);
+    }
+    trading_core::state_digest(&core)
+}
+
+#[test]
+fn the_state_digest_covers_the_last_trade_price() {
+    use protocol::{MarketEventKind, PriceTicks};
+
+    let with = |price: i64| {
+        market_state_digest(&[
+            MarketEventKind::SnapshotBegin { snapshot_seq: 1 },
+            MarketEventKind::SnapshotEnd {
+                snapshot_seq: 1,
+                level_count: 0,
+            },
+            MarketEventKind::Trade {
+                aggressor: Side::Buy,
+                price: PriceTicks(price),
+                quantity: QuantityLots(1),
+            },
+        ])
+    };
+    assert_ne!(with(100), with(101));
+    assert_eq!(with(100), with(100));
+}
+
+#[test]
+fn the_state_digest_covers_an_unfinished_snapshot() {
+    use protocol::{MarketEventKind, PriceTicks};
+
+    let with = |price: i64| {
+        market_state_digest(&[
+            MarketEventKind::SnapshotBegin { snapshot_seq: 1 },
+            MarketEventKind::SnapshotLevel {
+                side: Side::Buy,
+                price: PriceTicks(price),
+                quantity: QuantityLots(10),
+            },
+        ])
+    };
+    // Neither level is visible yet, but they decide the book at snapshot end.
+    assert_ne!(with(99), with(98));
+}
+
+#[test]
+fn the_state_digest_separates_pending_levels_from_visible_ones() {
+    use protocol::{MarketEventKind, PriceTicks};
+
+    let level = MarketEventKind::SnapshotLevel {
+        side: Side::Buy,
+        price: PriceTicks(99),
+        quantity: QuantityLots(10),
+    };
+    let pending = market_state_digest(&[MarketEventKind::SnapshotBegin { snapshot_seq: 1 }, level]);
+    let visible = market_state_digest(&[
+        MarketEventKind::SnapshotBegin { snapshot_seq: 1 },
+        level,
+        MarketEventKind::SnapshotEnd {
+            snapshot_seq: 1,
+            level_count: 1,
+        },
+    ]);
+    assert_ne!(pending, visible);
+}
+
 #[test]
 fn identical_input_produces_identical_output_and_state() {
     let (first, first_events) = run(2024, 5_000);

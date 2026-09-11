@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use engine_runtime::{ControlHandle, FeedSource, PipelineConfig};
+use engine_runtime::{ControlHandle, FeedSource, JournalSync, PipelineConfig};
 use trading_core::{EngineConfig, Generator, GeneratorConfig};
 
 use control_gateway::server;
@@ -34,6 +34,9 @@ struct Cli {
     events_per_second: u64,
     #[arg(long, default_value_t = 200)]
     snapshot_interval: u64,
+    /// Journal records the output thread may buffer before publishing them.
+    #[arg(long, default_value_t = 64)]
+    group_commit_records: u64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,6 +62,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 EngineConfig::single_instrument(u128::from(cli.seed)),
                 PipelineConfig {
                     journal_path: Some(engine_journal),
+                    // The gateway tails this journal, so records must become
+                    // visible on a bound instead of when a buffer happens to fill.
+                    journal_sync: JournalSync::GroupCommit(cli.group_commit_records),
                     snapshot_interval: cli.snapshot_interval,
                     snapshot_depth: 16,
                     paced: true,

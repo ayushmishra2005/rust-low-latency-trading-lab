@@ -54,7 +54,7 @@ impl TradingCore {
             )?,
         };
 
-        if (execution_limit.0 - reference.0).abs() > account.limits.price_collar_ticks {
+        if tick_distance(execution_limit, reference) > collar_ticks(account.limits) {
             return Err(RejectReason::PriceCollar);
         }
 
@@ -106,6 +106,11 @@ impl TradingCore {
             .get(order_id)
             .ok_or(RejectReason::OrderAlreadyTerminal)?;
 
+        // A replace may change price and quantity, never side or order type.
+        if request.side != existing.side || request.order_type != OrderType::Limit {
+            return Err(RejectReason::MalformedRequest);
+        }
+
         self.check_price(instrument_index, request.price)?;
         if request.quantity.is_zero() {
             return Err(RejectReason::InvalidQuantity);
@@ -129,7 +134,7 @@ impl TradingCore {
         if new_remaining > account.limits.max_order_quantity {
             return Err(RejectReason::MaxOrderQuantity);
         }
-        if (request.price.0 - reference.0).abs() > account.limits.price_collar_ticks {
+        if tick_distance(request.price, reference) > collar_ticks(account.limits) {
             return Err(RejectReason::PriceCollar);
         }
         let notional = new_remaining
@@ -309,6 +314,16 @@ impl TradingCore {
 
         Ok(())
     }
+}
+
+/// Tick distance that is correct for every pair of prices.
+fn tick_distance(left: PriceTicks, right: PriceTicks) -> u64 {
+    left.0.abs_diff(right.0)
+}
+
+/// A negative collar admits no distance at all.
+fn collar_ticks(limits: protocol::AccountLimits) -> u64 {
+    u64::try_from(limits.price_collar_ticks).unwrap_or(0)
 }
 
 fn worst_case_position(position: &InstrumentPosition, side: Side) -> Option<u64> {

@@ -9,6 +9,7 @@ module Settlement where
 
 import DA.Foldable (forA_)
 import DA.List (dedup)
+import DA.Text (intercalate)
 
 -- | Cash position held by one party at one operator.
 --
@@ -51,14 +52,30 @@ data Leg = Leg
     amount : Int
   deriving (Eq, Show)
 
--- | Proof that a settlement identity was applied. The contract key makes the
--- identity unique, so a duplicate submission fails instead of paying twice.
+-- | Deterministic text encoding of the economics of one settlement: the
+-- settlement id, the leg count, then every leg in order. This is a canonical
+-- encoding, not a cryptographic hash. The off-chain client builds the same
+-- string from the same data and compares it.
+canonicalEconomics : Text -> [Leg] -> Text
+canonicalEconomics settlementId legs =
+  intercalate "|" (settlementId :: show (length legs) :: map encodeLeg legs)
+
+encodeLeg : Leg -> Text
+encodeLeg leg =
+  partyToText leg.payer <> ">" <> partyToText leg.payee <> ":" <> show leg.amount
+
+-- | Proof of what a settlement identity actually moved. The legs, their count
+-- and the canonical encoding are written by the ledger from the legs that were
+-- applied, so the receipt records economics rather than a client-supplied
+-- string. The contract key makes the identity unique, so a duplicate
+-- submission fails instead of paying twice.
 template SettlementReceipt
   with
     operator : Party
     settlementId : Text
-    manifestHash : Text
     legs : [Leg]
+    legCount : Int
+    economics : Text
     parties : [Party]
   where
     signatory operator
@@ -73,7 +90,6 @@ template SettlementInstruction
   with
     operator : Party
     settlementId : Text
-    manifestHash : Text
     legs : [Leg]
     accepted : [Party]
   where
@@ -89,12 +105,23 @@ template SettlementInstruction
         assertMsg "party already accepted" (notElem party accepted)
         create this with accepted = party :: accepted
 
-    -- | Applies every leg atomically and records the receipt.
+    -- | Applies every leg atomically and records the receipt. The caller states
+    -- the economics it believes it is settling and the ledger refuses anything
+    -- else.
     choice Settle : ContractId SettlementReceipt
+      with
+        expectedLegs : [Leg]
+        expectedLegCount : Int
       controller operator
       do
         let parties = involvedParties legs
+        let economics = canonicalEconomics settlementId legs
         assertMsg "every involved party must accept first" (all (`elem` accepted) parties)
+        -- Check the legs match the instruction.
+        assertMsg "leg count does not match the instruction" (expectedLegCount == length legs)
+        assertMsg
+          "settled economics do not match the instruction"
+          (canonicalEconomics settlementId expectedLegs == economics)
         forA_ legs \leg -> do
           assertMsg "leg amount must be positive" (leg.amount > 0)
           assertMsg "a leg cannot pay itself" (leg.payer /= leg.payee)
@@ -103,8 +130,9 @@ template SettlementInstruction
         create SettlementReceipt with
           operator
           settlementId
-          manifestHash
           legs
+          legCount = length legs
+          economics
           parties
 
     choice Withdraw : ()

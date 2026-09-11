@@ -28,13 +28,12 @@ holdingAmount operator owner = do
     Some (_, holding) -> pure holding.amount
     None -> abort "missing holding"
 
-propose : Fixture -> Text -> Text -> [Leg] -> Script (ContractId SettlementInstruction)
-propose fixture settlementId manifestHash legs =
+propose : Fixture -> Text -> [Leg] -> Script (ContractId SettlementInstruction)
+propose fixture settlementId legs =
   submit fixture.operator do
     createCmd SettlementInstruction with
       operator = fixture.operator
       settlementId
-      manifestHash
       legs
       accepted = []
 
@@ -44,13 +43,24 @@ acceptAll fixture instruction (party :: rest) = do
   next <- submit party do exerciseCmd instruction Accept with party
   acceptAll fixture next rest
 
+-- | Settles by declaring the legs the caller believes it is applying.
+settle : Fixture -> ContractId SettlementInstruction -> [Leg] -> Script (ContractId SettlementReceipt)
+settle fixture instruction expectedLegs =
+  submit fixture.operator do
+    exerciseCmd instruction Settle with expectedLegs, expectedLegCount = length expectedLegs
+
+settleMustFail : Fixture -> ContractId SettlementInstruction -> [Leg] -> Script ()
+settleMustFail fixture instruction expectedLegs =
+  submitMustFail fixture.operator do
+    exerciseCmd instruction Settle with expectedLegs, expectedLegCount = length expectedLegs
+
 testSettlementMovesHoldingsAndConservesValue : Script ()
 testSettlementMovesHoldingsAndConservesValue = do
   fixture <- setup
   let legs = [Leg with payer = fixture.alice, payee = fixture.bob, amount = 250]
-  instruction <- propose fixture "stl_1" "hash_1" legs
+  instruction <- propose fixture "stl_1" legs
   ready <- acceptAll fixture instruction [fixture.alice, fixture.bob]
-  _ <- submit fixture.operator do exerciseCmd ready Settle
+  _ <- settle fixture ready legs
 
   aliceAmount <- holdingAmount fixture.operator fixture.alice
   bobAmount <- holdingAmount fixture.operator fixture.bob
@@ -62,9 +72,9 @@ testSettlementNeedsEveryParty : Script ()
 testSettlementNeedsEveryParty = do
   fixture <- setup
   let legs = [Leg with payer = fixture.alice, payee = fixture.bob, amount = 100]
-  instruction <- propose fixture "stl_2" "hash_2" legs
+  instruction <- propose fixture "stl_2" legs
   partial <- acceptAll fixture instruction [fixture.alice]
-  submitMustFail fixture.operator do exerciseCmd partial Settle
+  settleMustFail fixture partial legs
 
   aliceAmount <- holdingAmount fixture.operator fixture.alice
   aliceAmount === 1000
@@ -73,14 +83,14 @@ testDuplicateSettlementIdentityFails : Script ()
 testDuplicateSettlementIdentityFails = do
   fixture <- setup
   let legs = [Leg with payer = fixture.alice, payee = fixture.bob, amount = 100]
-  first <- propose fixture "stl_3" "hash_3" legs
+  first <- propose fixture "stl_3" legs
   ready <- acceptAll fixture first [fixture.alice, fixture.bob]
-  _ <- submit fixture.operator do exerciseCmd ready Settle
+  _ <- settle fixture ready legs
 
-  -- The same identity cannot produce a second receipt, even with a new manifest.
-  second <- propose fixture "stl_3" "hash_other" legs
+  -- The same identity cannot produce a second receipt.
+  second <- propose fixture "stl_3" legs
   readySecond <- acceptAll fixture second [fixture.alice, fixture.bob]
-  submitMustFail fixture.operator do exerciseCmd readySecond Settle
+  settleMustFail fixture readySecond legs
 
   aliceAmount <- holdingAmount fixture.operator fixture.alice
   aliceAmount === 900
@@ -89,9 +99,9 @@ testInsufficientHoldingFails : Script ()
 testInsufficientHoldingFails = do
   fixture <- setup
   let legs = [Leg with payer = fixture.alice, payee = fixture.bob, amount = 5000]
-  instruction <- propose fixture "stl_4" "hash_4" legs
+  instruction <- propose fixture "stl_4" legs
   ready <- acceptAll fixture instruction [fixture.alice, fixture.bob]
-  submitMustFail fixture.operator do exerciseCmd ready Settle
+  settleMustFail fixture ready legs
 
   aliceAmount <- holdingAmount fixture.operator fixture.alice
   aliceAmount === 1000
@@ -103,23 +113,90 @@ testBatchWithSeveralLegsIsAtomic = do
         [ Leg with payer = fixture.alice, payee = fixture.bob, amount = 300
         , Leg with payer = fixture.bob, payee = fixture.alice, amount = 100
         ]
-  instruction <- propose fixture "stl_5" "hash_5" legs
+  instruction <- propose fixture "stl_5" legs
   ready <- acceptAll fixture instruction [fixture.alice, fixture.bob]
-  _ <- submit fixture.operator do exerciseCmd ready Settle
+  _ <- settle fixture ready legs
 
   aliceAmount <- holdingAmount fixture.operator fixture.alice
   bobAmount <- holdingAmount fixture.operator fixture.bob
   aliceAmount === 800
   bobAmount === 1200
 
-testReceiptRecordsTheManifest : Script ()
-testReceiptRecordsTheManifest = do
+testReceiptRecordsTheSettledEconomics : Script ()
+testReceiptRecordsTheSettledEconomics = do
   fixture <- setup
   let legs = [Leg with payer = fixture.bob, payee = fixture.alice, amount = 10]
-  instruction <- propose fixture "stl_6" "manifest_hash_6" legs
+  instruction <- propose fixture "stl_6" legs
   ready <- acceptAll fixture instruction [fixture.alice, fixture.bob]
-  receipt <- submit fixture.operator do exerciseCmd ready Settle
+  receipt <- settle fixture ready legs
 
   Some stored <- queryContractId fixture.operator receipt
-  stored.manifestHash === "manifest_hash_6"
   stored.settlementId === "stl_6"
+  stored.legs === legs
+  stored.legCount === 1
+  stored.economics === canonicalEconomics "stl_6" legs
+
+testChangedAmountIsRefused : Script ()
+testChangedAmountIsRefused = do
+  fixture <- setup
+  let legs = [Leg with payer = fixture.alice, payee = fixture.bob, amount = 200]
+  instruction <- propose fixture "stl_7" legs
+  ready <- acceptAll fixture instruction [fixture.alice, fixture.bob]
+  settleMustFail fixture ready [Leg with payer = fixture.alice, payee = fixture.bob, amount = 900]
+
+  aliceAmount <- holdingAmount fixture.operator fixture.alice
+  aliceAmount === 1000
+
+testChangedParticipantIsRefused : Script ()
+testChangedParticipantIsRefused = do
+  fixture <- setup
+  carol <- allocatePartyWithHint "carol" (PartyIdHint "carol")
+  submit fixture.operator do createCmd Holding with operator = fixture.operator, owner = carol, amount = 1000
+  let legs = [Leg with payer = fixture.alice, payee = fixture.bob, amount = 200]
+  instruction <- propose fixture "stl_8" legs
+  ready <- acceptAll fixture instruction [fixture.alice, fixture.bob]
+
+  -- A different payee under the same settlement identity is not settleable.
+  settleMustFail fixture ready [Leg with payer = fixture.alice, payee = carol, amount = 200]
+  -- Nor is a different payer.
+  settleMustFail fixture ready [Leg with payer = carol, payee = fixture.bob, amount = 200]
+
+  aliceAmount <- holdingAmount fixture.operator fixture.alice
+  carolAmount <- holdingAmount fixture.operator carol
+  aliceAmount === 1000
+  carolAmount === 1000
+
+testExactDuplicateSettlementIsIdempotent : Script ()
+testExactDuplicateSettlementIsIdempotent = do
+  fixture <- setup
+  let legs = [Leg with payer = fixture.alice, payee = fixture.bob, amount = 150]
+  instruction <- propose fixture "stl_9" legs
+  ready <- acceptAll fixture instruction [fixture.alice, fixture.bob]
+  receipt <- settle fixture ready legs
+
+  -- Resending the identical batch does not move holdings a second time.
+  repeated <- propose fixture "stl_9" legs
+  readyAgain <- acceptAll fixture repeated [fixture.alice, fixture.bob]
+  settleMustFail fixture readyAgain legs
+
+  Some stored <- queryContractKey @SettlementReceipt fixture.operator (fixture.operator, "stl_9")
+  stored._1 === receipt
+  aliceAmount <- holdingAmount fixture.operator fixture.alice
+  bobAmount <- holdingAmount fixture.operator fixture.bob
+  aliceAmount === 850
+  bobAmount === 1150
+
+testLegCountMustMatch : Script ()
+testLegCountMustMatch = do
+  fixture <- setup
+  let legs =
+        [ Leg with payer = fixture.alice, payee = fixture.bob, amount = 100
+        , Leg with payer = fixture.bob, payee = fixture.alice, amount = 40
+        ]
+  instruction <- propose fixture "stl_10" legs
+  ready <- acceptAll fixture instruction [fixture.alice, fixture.bob]
+  submitMustFail fixture.operator do
+    exerciseCmd ready Settle with expectedLegs = legs, expectedLegCount = 1
+
+  aliceAmount <- holdingAmount fixture.operator fixture.alice
+  aliceAmount === 1000

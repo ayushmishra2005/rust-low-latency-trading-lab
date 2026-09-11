@@ -3,11 +3,44 @@ import anchor from '@coral-xyz/anchor';
 import type { Idl } from '@coral-xyz/anchor';
 
 const { AnchorProvider, BN, Program, Wallet } = anchor;
+import { createHash } from 'node:crypto';
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import type { SettlementAdapter, SubmitOutcome } from './adapter.js';
 import type { Manifest } from './manifest.js';
 
 const MAX_LEGS = 32;
+
+/** Domain tag: the 16 ASCII bytes `RLTL-SETTLE-V1  ` (two trailing spaces). */
+const MANIFEST_DOMAIN = Buffer.from('RLTL-SETTLE-V1  ', 'ascii');
+
+export interface SettlementLeg {
+  payer: PublicKey;
+  payee: PublicKey;
+  amount: bigint;
+}
+
+/**
+ * Canonical hash of the settlement legs, byte-identical to the program.
+ *
+ * Preimage: domain tag (16), settlement id (16), exchange key (32), leg count
+ * as u16 little-endian, then for each leg in order the payer collateral key
+ * (32), the payee collateral key (32) and the amount as u64 little-endian.
+ */
+export function settlementManifestHash(
+  settlementId: Buffer,
+  exchange: PublicKey,
+  legs: SettlementLeg[],
+): string {
+  const header = Buffer.alloc(2);
+  header.writeUInt16LE(legs.length);
+  const parts = [MANIFEST_DOMAIN, settlementId, exchange.toBuffer(), header];
+  for (const leg of legs) {
+    const amount = Buffer.alloc(8);
+    amount.writeBigUInt64LE(leg.amount);
+    parts.push(leg.payer.toBuffer(), leg.payee.toBuffer(), amount);
+  }
+  return createHash('sha256').update(Buffer.concat(parts)).digest('hex');
+}
 
 export interface SolanaVenueOptions {
   connection: Connection;
@@ -58,7 +91,8 @@ export class SolanaVenue implements SettlementAdapter {
     this.program = new Program(options.idl, provider);
   }
 
-  async submit(manifest: Manifest, manifestHash: string): Promise<SubmitOutcome> {
+  // The program stores the canonical legs hash, so the manifest hash is not sent.
+  async submit(manifest: Manifest, _manifestHash: string): Promise<SubmitOutcome> {
     const settlementId = settlementIdBytes(manifest.settlementId);
     const receipt = this.receiptAddress(settlementId);
 
@@ -70,11 +104,14 @@ export class SolanaVenue implements SettlementAdapter {
       return { kind: 'rejected', reason: message(error) };
     }
 
+    // The program recomputes this hash from the applied legs and refuses a mismatch.
+    const legsHash = this.hashLegs(settlementId, legs, collateral);
+
     try {
       const settleBatch = this.program.methods.settleBatch as unknown as SettleBatch;
       await settleBatch(
         Array.from(settlementId),
-        Array.from(Buffer.from(manifestHash, 'hex')),
+        Array.from(Buffer.from(legsHash, 'hex')),
         legs.map((leg) => ({
           payer: leg.payer,
           payee: leg.payee,
@@ -91,11 +128,25 @@ export class SolanaVenue implements SettlementAdapter {
         .rpc();
       return { kind: 'confirmed', receipt: receipt.toBase58() };
     } catch (error) {
-      return this.classify(error, manifest.settlementId, manifestHash);
+      return this.classify(error, manifest.settlementId, legsHash);
     }
   }
 
-  async lookup(settlementId: string, manifestHash: string): Promise<SubmitOutcome> {
+  async lookup(
+    settlementId: string,
+    manifestHash: string,
+    manifest?: Manifest,
+  ): Promise<SubmitOutcome> {
+    // The receipt holds the legs hash, so compare against the legs of this manifest.
+    let expected = manifestHash;
+    if (manifest !== undefined) {
+      try {
+        const { legs, collateral } = this.buildLegs(manifest);
+        expected = this.hashLegs(settlementIdBytes(manifest.settlementId), legs, collateral);
+      } catch (error) {
+        return { kind: 'rejected', reason: message(error) };
+      }
+    }
     const address = this.receiptAddress(settlementIdBytes(settlementId));
     let account;
     try {
@@ -108,7 +159,7 @@ export class SolanaVenue implements SettlementAdapter {
     }
     // Receipt layout: 8 byte discriminator, 32 byte exchange, 16 byte id, 32 byte hash.
     const stored = account.data.subarray(56, 88).toString('hex');
-    if (stored !== manifestHash) {
+    if (stored !== expected) {
       return { kind: 'rejected', reason: 'on-chain receipt has a different manifest hash' };
     }
     return { kind: 'alreadyApplied', receipt: address.toBase58() };
@@ -127,11 +178,27 @@ export class SolanaVenue implements SettlementAdapter {
     if (/blockhash not found|block height exceeded|timed out|fetch failed|ECONNREFUSED|503|429/i.test(text)) {
       return { kind: 'unknown', reason: text };
     }
-    if (/insufficient collateral|frozen|another exchange|greater than zero|has one constraint/i.test(text)) {
+    if (
+      /insufficient collateral|frozen|another exchange|greater than zero|has one constraint|manifest hash does not match/i.test(
+        text,
+      )
+    ) {
       return { kind: 'rejected', reason: text };
     }
     // An unclassified failure is not a decision.
     return { kind: 'unknown', reason: text };
+  }
+
+  private hashLegs(settlementId: Buffer, legs: Leg[], collateral: PublicKey[]): string {
+    return settlementManifestHash(
+      settlementId,
+      this.options.exchange,
+      legs.map((leg) => ({
+        payer: collateral[leg.payer]!,
+        payee: collateral[leg.payee]!,
+        amount: leg.amount,
+      })),
+    );
   }
 
   private receiptAddress(settlementId: Buffer): PublicKey {

@@ -13,6 +13,7 @@ pub struct FeedCounters {
     pub gaps: u64,
     pub resyncs: u64,
     pub out_of_order: u64,
+    pub invalid_prices: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,16 +42,12 @@ pub struct MarketView {
     last_trade_price: Option<PriceTicks>,
     last_update_time_ns: u64,
     counters: FeedCounters,
-}
-
-impl Default for MarketView {
-    fn default() -> MarketView {
-        MarketView::new()
-    }
+    min_price_ticks: i64,
+    max_price_ticks: i64,
 }
 
 impl MarketView {
-    pub fn new() -> MarketView {
+    pub fn new(min_price_ticks: i64, max_price_ticks: i64) -> MarketView {
         MarketView {
             state: FeedState::Unsynchronized,
             epoch: 0,
@@ -64,6 +61,8 @@ impl MarketView {
             last_trade_price: None,
             last_update_time_ns: 0,
             counters: FeedCounters::default(),
+            min_price_ticks,
+            max_price_ticks,
         }
     }
 
@@ -105,6 +104,25 @@ impl MarketView {
             (Some(bid), Some(ask)) if bid < ask => PriceTicks::midpoint(bid, ask),
             _ => self.last_trade_price,
         }
+    }
+
+    /// Sequence of the snapshot in progress, or of the last one applied.
+    pub fn snapshot_seq(&self) -> u64 {
+        self.snapshot_seq
+    }
+
+    /// Levels buffered by a snapshot that has not ended yet.
+    pub fn pending_levels(&self, side: Side) -> Vec<(PriceTicks, QuantityLots)> {
+        let levels = match side {
+            Side::Buy => &self.scratch_bids,
+            Side::Sell => &self.scratch_asks,
+        };
+        levels.iter().map(|(p, q)| (*p, QuantityLots(*q))).collect()
+    }
+
+    /// Levels counted so far in the snapshot in progress.
+    pub fn pending_level_count(&self) -> u32 {
+        self.scratch_levels
     }
 
     pub fn best(&self, side: Side) -> Option<PriceTicks> {
@@ -168,6 +186,19 @@ impl MarketView {
                     };
                 }
                 SequenceCheck::Ok => self.last_source_seq = source_seq,
+            }
+        }
+
+        // A price outside the instrument domain makes the feed untrustworthy.
+        if let Some(price) = quoted_price(kind) {
+            if price.0 < self.min_price_ticks || price.0 > self.max_price_ticks {
+                self.counters.invalid_prices += 1;
+                self.enter_gap();
+                return MarketUpdate {
+                    previous_state,
+                    state: self.state,
+                    duplicate: false,
+                };
             }
         }
 
@@ -287,6 +318,15 @@ impl MarketView {
     }
 }
 
+fn quoted_price(kind: MarketEventKind) -> Option<PriceTicks> {
+    match kind {
+        MarketEventKind::SnapshotLevel { price, .. }
+        | MarketEventKind::LevelSet { price, .. }
+        | MarketEventKind::Trade { price, .. } => Some(price),
+        _ => None,
+    }
+}
+
 enum SequenceCheck {
     Ok,
     Duplicate,
@@ -334,7 +374,7 @@ mod tests {
 
     #[test]
     fn snapshot_becomes_visible_only_at_the_end() {
-        let mut view = MarketView::new();
+        let mut view = MarketView::new(1, 10_000_000);
         view.apply(1, MarketEventKind::SnapshotBegin { snapshot_seq: 1 }, 1);
         view.apply(
             2,
@@ -362,7 +402,7 @@ mod tests {
 
     #[test]
     fn interrupted_snapshot_enters_gap() {
-        let mut view = MarketView::new();
+        let mut view = MarketView::new(1, 10_000_000);
         view.apply(1, MarketEventKind::SnapshotBegin { snapshot_seq: 1 }, 1);
         view.apply(
             2,
@@ -377,7 +417,7 @@ mod tests {
 
     #[test]
     fn duplicate_is_counted_and_ignored() {
-        let mut view = MarketView::new();
+        let mut view = MarketView::new(1, 10_000_000);
         snapshot(&mut view, 1);
         let update = view.apply(
             4,
@@ -395,7 +435,7 @@ mod tests {
 
     #[test]
     fn forward_jump_enters_gap_and_stops_applying() {
-        let mut view = MarketView::new();
+        let mut view = MarketView::new(1, 10_000_000);
         snapshot(&mut view, 1);
         view.apply(
             9,
@@ -415,8 +455,60 @@ mod tests {
     }
 
     #[test]
+    fn out_of_range_prices_are_rejected_and_never_become_the_reference() {
+        for price in [i64::MIN, i64::MIN + 9_000, -1, 0, i64::MAX, 10_000_001] {
+            let mut view = MarketView::new(1, 10_000_000);
+            snapshot(&mut view, 1);
+            assert_eq!(view.reference_price(), Some(PriceTicks(100)));
+
+            view.apply(
+                5,
+                MarketEventKind::Trade {
+                    aggressor: Side::Buy,
+                    price: PriceTicks(price),
+                    quantity: QuantityLots(1),
+                },
+                20,
+            );
+            assert_eq!(view.state(), FeedState::Gap);
+            assert_eq!(view.counters().invalid_prices, 1);
+            assert_eq!(view.last_trade_price(), None);
+
+            view.apply(
+                6,
+                MarketEventKind::LevelSet {
+                    side: Side::Buy,
+                    price: PriceTicks(price),
+                    quantity: QuantityLots(3),
+                },
+                21,
+            );
+            assert_eq!(view.counters().invalid_prices, 2);
+            assert_eq!(view.best_bid(), Some(PriceTicks(99)));
+            assert_eq!(view.reference_price(), Some(PriceTicks(100)));
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_snapshot_level_stops_the_snapshot() {
+        let mut view = MarketView::new(1, 10_000_000);
+        view.apply(1, MarketEventKind::SnapshotBegin { snapshot_seq: 1 }, 1);
+        view.apply(
+            2,
+            MarketEventKind::SnapshotLevel {
+                side: Side::Buy,
+                price: PriceTicks(i64::MIN),
+                quantity: QuantityLots(4),
+            },
+            2,
+        );
+        assert_eq!(view.state(), FeedState::Gap);
+        assert_eq!(view.reference_price(), None);
+    }
+
+    #[test]
     fn reference_price_is_the_midpoint_when_both_sides_are_valid() {
-        let mut view = MarketView::new();
+        let mut view = MarketView::new(1, 10_000_000);
         snapshot(&mut view, 1);
         assert_eq!(view.reference_price(), Some(PriceTicks(100)));
     }

@@ -16,7 +16,7 @@ import type Database from 'better-sqlite3';
 import { openDatabase } from '../src/db.js';
 import { SettlementDispatcher } from '../src/settlement/dispatcher.js';
 import { SettlementOutbox } from '../src/settlement/outbox.js';
-import { SolanaVenue } from '../src/settlement/solana.js';
+import { SolanaVenue, settlementManifestHash } from '../src/settlement/solana.js';
 import { settlementIdFor } from '../src/settlement/manifest.js';
 
 // Requires a local validator with the settlement program deployed:
@@ -129,6 +129,28 @@ after(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+// Golden vector shared with the Rust unit test in the settlement program.
+test('the canonical legs hash matches the on-chain golden vector', () => {
+  const settlementId = Buffer.from(Array.from({ length: 16 }, (_value, index) => index));
+  const legs = [
+    {
+      payer: new PublicKey(Buffer.alloc(32, 0x21)),
+      payee: new PublicKey(Buffer.alloc(32, 0x22)),
+      amount: 1_000n,
+    },
+    {
+      payer: new PublicKey(Buffer.alloc(32, 0x22)),
+      payee: new PublicKey(Buffer.alloc(32, 0x23)),
+      amount: 250_000n,
+    },
+  ];
+
+  assert.equal(
+    settlementManifestHash(settlementId, new PublicKey(Buffer.alloc(32, 0x11)), legs),
+    'd11c5555601792674da104cd7a9b35046858ec7d025f9e02cf1c2c83d9e9bd9a',
+  );
+});
+
 test('a batch settles on chain and the outbox confirms it', { skip: !enabled }, async () => {
   const { db, outbox } = newOutbox('confirm', 3);
   const dispatcher = new SettlementDispatcher(outbox, venue, 10);
@@ -159,7 +181,12 @@ test('the same identity with a different manifest is refused', { skip: !enabled 
   const settlementId = settlementIdFor('solana', 1n, 3n);
   outbox.createBatch(10);
   const manifest = outbox.manifestFor(settlementId);
-  const outcome = await venue.submit(manifest, 'ff'.repeat(32));
+  // Same identity, different economics, so the legs hash cannot match the receipt.
+  const altered = {
+    ...manifest,
+    trades: manifest.trades.map((trade) => ({ ...trade, quantityLots: '99' })),
+  };
+  const outcome = await venue.submit(altered, 'ff'.repeat(32));
   assert.equal(outcome.kind, 'rejected');
   db.close();
 });

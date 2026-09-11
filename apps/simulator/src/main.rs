@@ -6,8 +6,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use engine_runtime::harness::{open_loop_pipeline, queue_round_trip};
-use engine_runtime::{ControlHandle, FeedSource, PipelineConfig, RunSummary, WaitStrategy};
+use engine_runtime::harness::{open_loop_pipeline, queue_round_trip, BenchConfig, LatencyStats};
+use engine_runtime::{
+    ControlHandle, FeedSource, JournalSync, PipelineConfig, RunSummary, WaitStrategy,
+};
 use protocol::codec::{FileHeader, InstrumentSpec};
 use protocol::EngineInput;
 use trading_core::generator::to_frame;
@@ -57,8 +59,11 @@ enum Command {
         capacity: usize,
         #[arg(long, value_enum, default_value_t = Wait::Adaptive)]
         wait: Wait,
-        #[arg(long)]
-        durable_ack: bool,
+        /// Journal write mode: buffered, group commit size, or durable.
+        #[arg(long, value_enum, default_value_t = Journal::GroupCommit)]
+        journal_sync: Journal,
+        #[arg(long, default_value_t = 256)]
+        group_commit_records: u64,
     },
     /// Replay in a single thread, optionally stopping at an engine sequence.
     Step {
@@ -99,7 +104,31 @@ enum Command {
         wait: Wait,
         #[arg(long, default_value_t = 100_000)]
         queue_samples: usize,
+        /// Measured runs per offered rate. One warm-up run is never published.
+        #[arg(long, default_value_t = 5)]
+        runs: usize,
+        /// Events for the runtime-with-journal section. Durable acknowledgement
+        /// syncs every record, so this stays smaller than the pipeline workload.
+        #[arg(long, default_value_t = 5_000)]
+        journal_events: usize,
     },
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum Journal {
+    Buffered,
+    GroupCommit,
+    Durable,
+}
+
+impl Journal {
+    fn resolve(self, records: u64) -> JournalSync {
+        match self {
+            Journal::Buffered => JournalSync::Buffered,
+            Journal::GroupCommit => JournalSync::GroupCommit(records),
+            Journal::Durable => JournalSync::Durable,
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -136,7 +165,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             checkpoint_interval,
             capacity,
             wait,
-            durable_ack,
+            journal_sync,
+            group_commit_records,
         } => replay(
             input,
             seed,
@@ -145,7 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             checkpoint_interval,
             capacity,
             wait.into(),
-            durable_ack,
+            journal_sync.resolve(group_commit_records),
         ),
         Command::Step {
             seed,
@@ -166,7 +196,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             capacity,
             wait,
             queue_samples,
-        } => bench(seed, events, &rate, capacity, wait.into(), queue_samples),
+            runs,
+            journal_events,
+        } => bench(
+            seed,
+            events,
+            &rate,
+            capacity,
+            wait.into(),
+            queue_samples,
+            runs,
+            journal_events,
+        ),
     }
 }
 
@@ -242,7 +283,7 @@ fn replay(
     checkpoint_interval: u64,
     capacity: usize,
     wait: WaitStrategy,
-    durable_ack: bool,
+    journal_sync: JournalSync,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (source, run_id) = load_source(input, seed, events)?;
     let summary = engine_runtime::run(
@@ -252,7 +293,7 @@ fn replay(
             output_capacity: capacity,
             wait,
             journal_path: journal,
-            durable_ack,
+            journal_sync,
             checkpoint_interval,
             snapshot_interval: 0,
             ..PipelineConfig::default()
@@ -379,6 +420,7 @@ fn verify(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench(
     seed: u64,
     events: usize,
@@ -386,6 +428,8 @@ fn bench(
     capacity: usize,
     wait: WaitStrategy,
     queue_samples: usize,
+    runs: usize,
+    journal_events: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Environment::capture().print();
     println!();
@@ -408,30 +452,162 @@ fn bench(
     println!();
 
     let inputs = workload(seed, events, false, false);
-    println!("pipeline order-to-report latency:");
+    println!("engine pipeline: feed -> queue -> engine -> report");
+    println!("no journal, no snapshots, no control API");
+    println!("runs={runs} measured per offered rate, after one unpublished warm-up run");
     for rate in rates {
-        let result = open_loop_pipeline(
-            EngineConfig::single_instrument(u128::from(seed)),
-            inputs.clone(),
-            capacity,
-            wait,
-            *rate,
-        );
         let label = if *rate == 0 {
             "unpaced".to_string()
         } else {
             format!("{rate}/s")
         };
-        println!("  offered={label}");
-        println!("    {}", result.order_to_report);
+        let config = BenchConfig::new(capacity, wait, *rate);
+        // The warm-up result is measured but never published.
+        open_loop_pipeline(
+            EngineConfig::single_instrument(u128::from(seed)),
+            inputs.clone(),
+            config,
+        );
+
+        let mut results = Vec::with_capacity(runs);
+        for run in 1..=runs {
+            let result = open_loop_pipeline(
+                EngineConfig::single_instrument(u128::from(seed)),
+                inputs.clone(),
+                config,
+            );
+            println!("  offered={label} run={run}");
+            println!(
+                "    scheduled-arrival-to-report {}",
+                result.arrival_to_report
+            );
+            println!(
+                "    enqueue-to-report           {}",
+                result.enqueue_to_report
+            );
+            println!(
+                "    throughput={:.0} msg/s outputs={} generator_behind={} input_high_water={} output_high_water={}",
+                result.messages_per_second(),
+                result.outputs,
+                result.generator_behind,
+                result.input_high_water,
+                result.output_high_water
+            );
+            results.push(result);
+        }
+        println!("  offered={label} aggregate over {runs} runs");
+        aggregate(
+            "scheduled-arrival-to-report",
+            &results
+                .iter()
+                .map(|r| r.arrival_to_report)
+                .collect::<Vec<_>>(),
+        );
+        aggregate(
+            "enqueue-to-report",
+            &results
+                .iter()
+                .map(|r| r.enqueue_to_report)
+                .collect::<Vec<_>>(),
+        );
+        let mut throughput: Vec<u64> = results
+            .iter()
+            .map(|r| r.messages_per_second() as u64)
+            .collect();
+        let mut behind: Vec<u64> = results.iter().map(|r| r.generator_behind).collect();
         println!(
-            "    throughput={:.0} msg/s outputs={} generator_behind={} input_high_water={} output_high_water={}",
-            result.messages_per_second(),
-            result.outputs,
-            result.generator_behind,
-            result.input_high_water,
-            result.output_high_water
+            "    throughput median={} msg/s min={} max={}",
+            median(&mut throughput),
+            throughput.iter().min().copied().unwrap_or(0),
+            throughput.iter().max().copied().unwrap_or(0)
+        );
+        println!(
+            "    generator_behind median={} max={} samples={}",
+            median(&mut behind),
+            behind.iter().max().copied().unwrap_or(0),
+            results[0].arrival_to_report.count
         );
     }
+
+    println!();
+    println!("runtime with journal: the shipped run() path");
+    println!("canonical input recording, journal enabled, snapshots every 1000");
+    println!("workload: {journal_events} events");
+    println!("boundary: whole-run throughput. This path carries no per-event");
+    println!("wall-clock stamp, so no latency percentile is reported for it.");
+    let journal_inputs = workload(seed, journal_events, false, false);
+    let journal_dir = std::env::temp_dir().join("rltl-bench-journal");
+    std::fs::create_dir_all(&journal_dir)?;
+    for (name, sync) in [
+        ("buffered", JournalSync::Buffered),
+        ("group-commit-64", JournalSync::GroupCommit(64)),
+        ("durable-ack", JournalSync::Durable),
+    ] {
+        let path = journal_dir.join(format!("{name}.journal"));
+        let mut throughput = Vec::with_capacity(runs);
+        for run in 1..=runs {
+            let summary = engine_runtime::run(
+                EngineConfig::single_instrument(u128::from(seed)),
+                PipelineConfig {
+                    input_capacity: capacity,
+                    output_capacity: capacity,
+                    wait,
+                    journal_path: Some(path.clone()),
+                    journal_sync: sync,
+                    snapshot_interval: 1_000,
+                    snapshot_depth: 16,
+                    ..PipelineConfig::default()
+                },
+                FeedSource::Memory(journal_inputs.clone()),
+                ControlHandle::default(),
+            )?;
+            let rate = summary.inputs as f64 * 1e9 / summary.elapsed_ns as f64;
+            println!(
+                "  journal={name} run={run} throughput={rate:.0} msg/s inputs={} outputs={} journal_records={}",
+                summary.inputs, summary.outputs, summary.journal_records
+            );
+            throughput.push(rate as u64);
+        }
+        println!(
+            "  journal={name} aggregate throughput median={} msg/s min={} max={}",
+            median(&mut throughput),
+            throughput.iter().min().copied().unwrap_or(0),
+            throughput.iter().max().copied().unwrap_or(0)
+        );
+        std::fs::remove_file(&path).ok();
+    }
     Ok(())
+}
+
+fn median(values: &mut [u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    values[values.len() / 2]
+}
+
+/// Prints the median across runs, with the spread across runs beside it.
+fn aggregate(name: &str, runs: &[LatencyStats]) {
+    let spread = |mut values: Vec<u64>| {
+        let min = values.iter().min().copied().unwrap_or(0);
+        let max = values.iter().max().copied().unwrap_or(0);
+        format!("median={}ns min={min}ns max={max}ns", median(&mut values))
+    };
+    println!(
+        "    {name} p50 {}",
+        spread(runs.iter().map(|r| r.p50_ns).collect())
+    );
+    println!(
+        "    {name} p99 {}",
+        spread(runs.iter().map(|r| r.p99_ns).collect())
+    );
+    println!(
+        "    {name} p99.9 {}",
+        spread(runs.iter().map(|r| r.p999_ns).collect())
+    );
+    println!(
+        "    {name} max {}",
+        spread(runs.iter().map(|r| r.max_ns).collect())
+    );
 }

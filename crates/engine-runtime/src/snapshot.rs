@@ -61,39 +61,44 @@ pub struct EngineSnapshot {
     pub positions: Vec<PositionSnapshot>,
 }
 
-/// Copies a bounded read model out of the engine. Called on the engine thread at
-/// a configured interval, so the depth is limited.
+/// Orders a snapshot may carry per level of requested depth.
+const ORDERS_PER_LEVEL: usize = 8;
+
+/// Copies a bounded read model out of the engine. Called on the engine thread,
+/// so it reads at most `depth` levels per side and `depth * 8` orders per
+/// instrument, whatever the live order count is.
 pub fn capture(core: &TradingCore, depth: usize) -> EngineSnapshot {
     let mut instruments = Vec::with_capacity(core.instruments().len());
     let mut positions = Vec::new();
 
+    let max_orders = depth.saturating_mul(ORDERS_PER_LEVEL);
     for instrument in core.instruments() {
-        let mut levels = Vec::new();
+        let mut levels = Vec::with_capacity(depth * 2);
+        let mut orders = Vec::with_capacity(max_orders);
+        // Only the top levels are read, so cost follows the depth, not the book.
         for side in [Side::Buy, Side::Sell] {
-            for (price, level) in instrument.book.levels(side).into_iter().take(depth) {
+            for (price, level) in instrument.book.top_levels(side, depth) {
                 levels.push(LevelSnapshot {
                     side,
                     price,
                     quantity: QuantityLots(level.total_remaining),
                     order_count: level.order_count,
                 });
-            }
-        }
-        let mut orders = Vec::new();
-        for (_, _, level_orders) in instrument.book.snapshot() {
-            for order in level_orders {
-                if orders.len() >= depth * 8 {
-                    break;
+                let room = max_orders.saturating_sub(orders.len());
+                if room == 0 {
+                    continue;
                 }
-                orders.push(OrderSnapshot {
-                    order_id: order.order_id,
-                    account: order.account,
-                    client_order_id: order.client_order_id,
-                    side: order.side,
-                    price: order.price,
-                    total_quantity: order.total_quantity,
-                    cumulative_filled: order.cumulative_filled,
-                });
+                for order in instrument.book.level_orders_upto(side, price, room) {
+                    orders.push(OrderSnapshot {
+                        order_id: order.order_id,
+                        account: order.account,
+                        client_order_id: order.client_order_id,
+                        side: order.side,
+                        price: order.price,
+                        total_quantity: order.total_quantity,
+                        cumulative_filled: order.cumulative_filled,
+                    });
+                }
             }
         }
         instruments.push(InstrumentSnapshot {

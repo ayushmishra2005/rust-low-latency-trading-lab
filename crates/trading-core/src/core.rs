@@ -77,7 +77,7 @@ impl TradingCore {
             .iter()
             .map(|instrument| InstrumentRuntime {
                 config: instrument.clone(),
-                market: MarketView::new(),
+                market: MarketView::new(instrument.min_price_ticks, instrument.max_price_ticks),
                 book: OrderBook::with_capacity(config.max_live_orders),
             })
             .collect();
@@ -326,6 +326,7 @@ impl TradingCore {
             checked.account_index,
             request,
             order_id,
+            request.side,
             checked.execution_limit,
             request.quantity,
             out,
@@ -477,6 +478,7 @@ impl TradingCore {
             account_index,
             request,
             order_id,
+            existing.side,
             request.price,
             target_remaining,
             out,
@@ -528,6 +530,7 @@ impl TradingCore {
         account_index: usize,
         request: &OrderRequest,
         order_id: OrderId,
+        side: Side,
         limit: PriceTicks,
         quantity: QuantityLots,
         out: &mut Vec<OutputEvent>,
@@ -535,7 +538,7 @@ impl TradingCore {
         self.fills.clear();
         let filled = matching::match_order(
             &mut self.instruments[instrument_index].book,
-            request.side,
+            side,
             limit,
             quantity,
             &mut self.fills,
@@ -558,8 +561,8 @@ impl TradingCore {
             self.metrics.trades += 1;
 
             let maker_account_index = self.account_index[&fill.maker_account];
-            self.settle_fill(maker_account_index, instrument_index, &fill, request.side);
-            self.settle_taker(account_index, instrument_index, request.side, fill.quantity);
+            self.settle_fill(maker_account_index, instrument_index, &fill, side);
+            self.settle_taker(account_index, instrument_index, side, fill.quantity);
 
             let output_seq = self.take_output_seq();
             out.push(OutputEvent::Trade(TradeEvent {
@@ -572,7 +575,7 @@ impl TradingCore {
                 taker_order_id: order_id,
                 maker_account: fill.maker_account,
                 taker_account: request.account,
-                aggressor: request.side,
+                aggressor: side,
                 price: fill.price,
                 quantity: fill.quantity,
             }));
@@ -596,7 +599,7 @@ impl TradingCore {
                 } else {
                     OrderState::PartiallyFilled
                 },
-                side: request.side.opposite(),
+                side: side.opposite(),
                 order_type: OrderType::Limit,
                 price: fill.price,
                 total_quantity: fill.maker_total_quantity,
@@ -615,6 +618,7 @@ impl TradingCore {
             }
 
             let mut taker_report = self.base_report(request, order_id);
+            taker_report.side = side;
             taker_report.kind = if taker_cumulative == quantity {
                 ReportKind::Filled
             } else {

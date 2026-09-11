@@ -88,7 +88,7 @@ export class SettlementDispatcher {
     // venue that confirms it holds no receipt gets the batch a second time.
     let outcome =
       row.status === 'unknown' || row.status === 'submitted'
-        ? await this.adapter.lookup(row.settlementId, row.manifestHash)
+        ? await this.adapter.lookup(row.settlementId, row.manifestHash, manifest)
         : await this.submit(row, manifest);
     if (outcome.kind === 'notFound') {
       outcome = await this.submit(row, manifest);

@@ -11,7 +11,36 @@ use protocol::{
 
 use crate::core::TradingCore;
 
-pub const STATE_SCHEMA_VERSION: u32 = 1;
+pub const STATE_SCHEMA_VERSION: u32 = 2;
+
+// Section tags. Every variable-length section carries its tag and its length,
+// so two different shapes can never encode to the same bytes.
+const SECTION_HEADER: u8 = 1;
+const SECTION_INSTRUMENT: u8 = 2;
+const SECTION_MARKET_LEVELS: u8 = 3;
+const SECTION_PENDING_LEVELS: u8 = 4;
+const SECTION_BOOK_LEVEL: u8 = 5;
+const SECTION_ACCOUNT: u8 = 6;
+const SECTION_POSITIONS: u8 = 7;
+const SECTION_DEDUP: u8 = 8;
+
+fn section(out: &mut Vec<u8>, tag: u8, count: usize) {
+    out.push(tag);
+    out.extend_from_slice(&(count as u64).to_le_bytes());
+}
+
+fn optional_price(out: &mut Vec<u8>, price: Option<protocol::PriceTicks>) {
+    match price {
+        Some(price) => {
+            out.push(1);
+            out.extend_from_slice(&price.0.to_le_bytes());
+        }
+        None => {
+            out.push(0);
+            out.extend_from_slice(&0i64.to_le_bytes());
+        }
+    }
+}
 
 pub type Digest = [u8; 32];
 
@@ -243,6 +272,7 @@ pub fn state_digest(core: &TradingCore) -> Digest {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = Vec::with_capacity(1024);
 
+    section(&mut buffer, SECTION_HEADER, 0);
     buffer.extend_from_slice(&STATE_SCHEMA_VERSION.to_le_bytes());
     buffer.extend_from_slice(&core.config().run_id.to_le_bytes());
     buffer.extend_from_slice(&core.engine_seq().0.to_le_bytes());
@@ -258,24 +288,45 @@ pub fn state_digest(core: &TradingCore) -> Digest {
     // Instruments in numeric ID order.
     let mut instrument_order: Vec<usize> = (0..core.instruments().len()).collect();
     instrument_order.sort_by_key(|index| core.instruments()[*index].config.id);
+    section(&mut buffer, SECTION_INSTRUMENT, instrument_order.len());
+    hasher.update(&buffer);
     for index in &instrument_order {
         let instrument = &core.instruments()[*index];
+        let market = &instrument.market;
         buffer.clear();
         buffer.extend_from_slice(&instrument.config.id.0.to_le_bytes());
         buffer.extend_from_slice(&instrument.config.tick_size.to_le_bytes());
         buffer.extend_from_slice(&instrument.config.lot_size.to_le_bytes());
-        buffer.push(instrument.market.state().wire());
-        buffer.extend_from_slice(&instrument.market.epoch().to_le_bytes());
-        buffer.extend_from_slice(&instrument.market.last_source_seq().to_le_bytes());
-        buffer.extend_from_slice(&instrument.market.last_update_time_ns().to_le_bytes());
+        buffer.extend_from_slice(&instrument.config.min_price_ticks.to_le_bytes());
+        buffer.extend_from_slice(&instrument.config.max_price_ticks.to_le_bytes());
+        buffer.push(market.state().wire());
+        buffer.extend_from_slice(&market.epoch().to_le_bytes());
+        buffer.extend_from_slice(&market.last_source_seq().to_le_bytes());
+        buffer.extend_from_slice(&market.last_update_time_ns().to_le_bytes());
+        // Reference price inputs and in-progress snapshot state.
+        optional_price(&mut buffer, market.last_trade_price());
+        buffer.extend_from_slice(&market.snapshot_seq().to_le_bytes());
+        buffer.extend_from_slice(&market.pending_level_count().to_le_bytes());
         for side in [Side::Buy, Side::Sell] {
-            for (price, quantity) in instrument.market.levels(side) {
-                buffer.push(side.wire());
+            let levels = market.levels(side);
+            section(&mut buffer, SECTION_MARKET_LEVELS, levels.len());
+            buffer.push(side.wire());
+            for (price, quantity) in levels {
+                buffer.extend_from_slice(&price.0.to_le_bytes());
+                buffer.extend_from_slice(&quantity.0.to_le_bytes());
+            }
+            let pending = market.pending_levels(side);
+            section(&mut buffer, SECTION_PENDING_LEVELS, pending.len());
+            buffer.push(side.wire());
+            for (price, quantity) in pending {
                 buffer.extend_from_slice(&price.0.to_le_bytes());
                 buffer.extend_from_slice(&quantity.0.to_le_bytes());
             }
         }
-        for (side, price, orders) in instrument.book.snapshot() {
+        let book = instrument.book.snapshot();
+        section(&mut buffer, SECTION_BOOK_LEVEL, book.len());
+        for (side, price, orders) in book {
+            section(&mut buffer, SECTION_BOOK_LEVEL, orders.len());
             buffer.push(side.wire());
             buffer.extend_from_slice(&price.0.to_le_bytes());
             for order in orders {
@@ -293,6 +344,9 @@ pub fn state_digest(core: &TradingCore) -> Digest {
     // Accounts in numeric ID order.
     let mut account_order: Vec<usize> = (0..core.accounts().len()).collect();
     account_order.sort_by_key(|index| core.accounts()[*index].id);
+    buffer.clear();
+    section(&mut buffer, SECTION_ACCOUNT, account_order.len());
+    hasher.update(&buffer);
     for index in &account_order {
         let account = &core.accounts()[*index];
         buffer.clear();
@@ -304,6 +358,7 @@ pub fn state_digest(core: &TradingCore) -> Digest {
         buffer.extend_from_slice(&account.limits.max_gross_exposure.0.to_le_bytes());
         buffer.extend_from_slice(&account.limits.price_collar_ticks.to_le_bytes());
         buffer.extend_from_slice(&account.last_client_seq.to_le_bytes());
+        section(&mut buffer, SECTION_POSITIONS, instrument_order.len());
         for instrument_index in &instrument_order {
             let position = &account.positions[*instrument_index];
             buffer.extend_from_slice(&position.position_lots.to_le_bytes());
@@ -312,7 +367,9 @@ pub fn state_digest(core: &TradingCore) -> Digest {
             buffer.extend_from_slice(&position.open_buy_notional.to_le_bytes());
             buffer.extend_from_slice(&position.open_sell_notional.to_le_bytes());
         }
-        for (request_id, fingerprint, outcome) in account.cache.canonical_entries() {
+        let dedup = account.cache.canonical_entries();
+        section(&mut buffer, SECTION_DEDUP, dedup.len());
+        for (request_id, fingerprint, outcome) in dedup {
             buffer.extend_from_slice(&request_id.0.to_le_bytes());
             buffer.extend_from_slice(&fingerprint.to_le_bytes());
             buffer.extend_from_slice(&outcome.order_id.0.to_le_bytes());
@@ -331,4 +388,26 @@ pub fn digest_hex(digest: &Digest) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn framing_keeps_different_collection_splits_apart() {
+        let mut left = Vec::new();
+        section(&mut left, SECTION_MARKET_LEVELS, 2);
+        left.extend_from_slice(&[1, 2]);
+        section(&mut left, SECTION_PENDING_LEVELS, 1);
+        left.push(3);
+
+        let mut right = Vec::new();
+        section(&mut right, SECTION_MARKET_LEVELS, 1);
+        right.push(1);
+        section(&mut right, SECTION_PENDING_LEVELS, 2);
+        right.extend_from_slice(&[2, 3]);
+
+        assert_ne!(left, right);
+    }
 }

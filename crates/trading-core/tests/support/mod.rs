@@ -146,11 +146,26 @@ impl Harness {
         &mut self,
         account: u32,
         target: u64,
+        side: Side,
+        price: i64,
+        new_total: u64,
+    ) -> &[OutputEvent] {
+        self.replace_as(account, target, side, OrderType::Limit, price, new_total)
+    }
+
+    pub fn replace_as(
+        &mut self,
+        account: u32,
+        target: u64,
+        side: Side,
+        order_type: OrderType,
         price: i64,
         new_total: u64,
     ) -> &[OutputEvent] {
         let mut request = self.request(account, RequestKind::Replace);
         request.target_client_order_id = ClientOrderId(target);
+        request.side = side;
+        request.order_type = order_type;
         request.price = PriceTicks(price);
         request.quantity = QuantityLots(new_total);
         self.apply(InputEvent::Order(request))
