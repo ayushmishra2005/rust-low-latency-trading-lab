@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use engine_runtime::snapshot::EngineSnapshot;
-use engine_runtime::{ControlHandle, JournalTail};
+use engine_runtime::{ControlHandle, JournalError, JournalTail};
 use protocol::{AccountId, AccountLimits, ControlCommand, Notional, OutputEvent, QuantityLots};
 use serde_json::{json, Value};
 use trading_core::replay::digest_hex;
@@ -84,7 +84,11 @@ impl Gateway {
     pub fn next_outputs(&self, limit: usize) -> Result<Vec<OutputEvent>, String> {
         let mut guard = self.tail.lock().expect("tail mutex");
         if guard.is_none() {
-            *guard = Some(JournalTail::open(&self.journal_path).map_err(|e| e.to_string())?);
+            match JournalTail::open(&self.journal_path) {
+                Ok(tail) => *guard = Some(tail),
+                Err(JournalError::IncompleteHeader) => return Ok(Vec::new()),
+                Err(error) => return Err(error.to_string()),
+            }
         }
         let tail = guard.as_mut().expect("tail is open");
         match tail.poll(limit) {

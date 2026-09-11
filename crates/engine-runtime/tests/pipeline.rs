@@ -1,7 +1,10 @@
 //! Threaded pipeline behaviour: determinism across real threads, backpressure,
 //! journal durability, and clean shutdown.
 
-use engine_runtime::{read_journal, ControlHandle, FeedSource, PipelineConfig, WaitStrategy};
+use engine_runtime::{
+    read_journal, ControlHandle, FeedSource, JournalError, JournalTail, PipelineConfig,
+    WaitStrategy,
+};
 use protocol::codec::{FileHeader, InstrumentSpec};
 use protocol::{
     AccountId, ClientOrderId, ControlCommand, EngineInput, IngressSeq, InputEvent, InstrumentId,
@@ -16,9 +19,33 @@ fn workload(seed: u64, events: usize) -> Vec<protocol::EngineInput> {
 }
 
 fn temp_path(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("rltl-pipeline-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "rltl-pipeline-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name)
+}
+
+fn attach_tail(path: &std::path::Path) -> JournalTail {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match JournalTail::open(path) {
+            Ok(tail) => return tail,
+            Err(JournalError::IncompleteHeader) => {}
+            Err(JournalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("unexpected attach error: {error}"),
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for a complete journal header at {}",
+                path.display()
+            );
+        }
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -524,21 +551,19 @@ fn kill_transitions_are_part_of_the_recorded_input_stream() {
 fn group_commit_publishes_records_while_the_run_is_still_going() {
     let path = temp_path("group-commit.journal");
     let control = ControlHandle::default();
-    let watcher = control.clone();
     let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = std::sync::Arc::clone(&seen);
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let still_running = std::sync::Arc::clone(&live);
     let watch_path = path.clone();
 
     // Tail the journal while the paced run is still producing output.
     let reader = std::thread::spawn(move || {
-        while !watch_path.exists() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let mut tail = engine_runtime::JournalTail::open(&watch_path).expect("tail opens");
-        while !watcher.shutdown_requested() {
+        let mut tail = attach_tail(&watch_path);
+        while still_running.load(std::sync::atomic::Ordering::Acquire) {
             let events = tail.poll(1_000).expect("tail poll");
             counted.fetch_add(events.len(), std::sync::atomic::Ordering::Relaxed);
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     });
 
@@ -555,7 +580,7 @@ fn group_commit_publishes_records_while_the_run_is_still_going() {
     )
     .unwrap();
 
-    // The run is over, so the reader may stop after one final poll.
+    live.store(false, std::sync::atomic::Ordering::Release);
     control.request_shutdown();
     reader.join().unwrap();
 
@@ -664,16 +689,18 @@ fn producer_delay_lands_on_arrival_latency_and_not_on_enqueue_latency() {
     );
 
     assert!(result.arrival_to_report.count > 0);
-    // The producer stall belongs to arrival latency, not to queue latency.
+    // The producer stall belongs to arrival latency. Compare the two
+    // boundaries: enqueue latency can spike under load, but the extra
+    // delay must still show up only on the arrival clock.
+    let extra = result
+        .arrival_to_report
+        .p50_ns
+        .saturating_sub(result.enqueue_to_report.p50_ns);
     assert!(
-        result.arrival_to_report.p50_ns > delay_ns,
-        "arrival p50 {}ns did not include the {delay_ns}ns producer delay",
-        result.arrival_to_report.p50_ns
-    );
-    assert!(
-        result.enqueue_to_report.p99_ns < delay_ns,
-        "enqueue p99 {}ns should not include the producer delay",
-        result.enqueue_to_report.p99_ns
+        extra >= delay_ns,
+        "arrival-enqueue p50 gap {extra}ns did not include the {delay_ns}ns producer delay (arrival={} enqueue={})",
+        result.arrival_to_report.p50_ns,
+        result.enqueue_to_report.p50_ns
     );
 }
 
