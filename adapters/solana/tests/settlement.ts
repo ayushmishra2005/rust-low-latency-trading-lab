@@ -1,5 +1,14 @@
-import * as anchor from '@coral-xyz/anchor';
-import { Program, BN } from '@coral-xyz/anchor';
+// @coral-xyz/anchor is CommonJS. Node 22 ESM cannot named-import BN
+// (it is a getter, not a static export). ts-mocha compiles this file
+// to CommonJS, where a default import has no `.default`. Unwrap both.
+import * as anchorImport from '@coral-xyz/anchor';
+import type { Program } from '@coral-xyz/anchor';
+
+type AnchorApi = typeof anchorImport;
+const loaded = anchorImport as AnchorApi & { default?: AnchorApi };
+const anchor: AnchorApi =
+  typeof loaded.BN === 'function' ? loaded : (loaded.default as AnchorApi);
+const { BN } = anchor;
 import {
   createMint,
   createAssociatedTokenAccount,
