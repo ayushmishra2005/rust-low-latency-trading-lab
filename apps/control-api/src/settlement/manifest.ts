@@ -52,9 +52,14 @@ export function manifestHash(manifest: Manifest): string {
  * Business identity of a settlement. Derived from the trade range, so a retry
  * after a timeout resubmits the same identity instead of creating a new one.
  */
-export function settlementIdFor(venue: string, firstTradeId: bigint, lastTradeId: bigint): string {
+export function settlementIdFor(
+  venue: string,
+  firstTradeId: bigint,
+  lastTradeId: bigint,
+  runId = '0',
+): string {
   const digest = createHash('sha256')
-    .update(`${venue}|${firstTradeId.toString()}|${lastTradeId.toString()}`)
+    .update(`${venue}|${runId}|${firstTradeId.toString()}|${lastTradeId.toString()}`)
     .digest('hex');
   return `stl_${digest.slice(0, 32)}`;
 }

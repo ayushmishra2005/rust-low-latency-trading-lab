@@ -97,7 +97,9 @@ order untouched.
 
 **Market data.** Feed prices are validated against the instrument price domain. A snapshot level,
 level update, or trade outside that domain puts the feed into a gap rather than becoming a
-reference price, so a hostile or corrupt feed cannot move the collar.
+reference price, so a hostile or corrupt feed cannot move the collar. The retained view is a
+configured top-N ladder per side (default 256), not a full market book: best bid and ask stay
+correct, deeper valid levels are dropped, and snapshots are truncated to that depth.
 
 ---
 
@@ -173,7 +175,8 @@ transitions, so neither concurrency nor operator action can change the result.
 
 Risk runs inline on the engine thread, in a fixed order, before anything touches the book:
 
-1. Duplicate request detection against a bounded per-account window
+1. Duplicate request detection against a bounded per-account ring with an O(1) request-id index.
+   Replay walks the ring, never the index map.
 2. Field, account, and instrument validation
 3. Kill switch and per-account enablement
 4. Client sequence monotonicity
@@ -199,20 +202,29 @@ engaging, releasing, and engaging again all reach the engine, and each transitio
 > described. Re-run them yourself; they will differ on your hardware.
 
 **Environment:** Apple M5 Max, 18 logical cores, macOS 25.6.0 (aarch64), rustc 1.97.1, release
-profile, commit `4d84465` with this pass applied. This is a development laptop, not an isolated
-measurement host.
+profile, commit `5617115` with this working tree applied. This is a development laptop, not an
+isolated measurement host.
 
 ### Microbenchmarks (Criterion, `cargo bench -p trading-core`)
 
 | Benchmark | Median | Notes |
 | --- | --- | --- |
-| `codec/decode_one_frame` | 26.1 ns | One market-data frame, bounds- and CRC-checked |
-| `book/insert_1000` | 15.5 µs | 1,000 resting orders across 50 price levels |
-| `book/cancel_head` | 23.5 µs | 1,000 cancels by order id, O(1) unlink each |
-| `book/match_multi_level_sweep` | 20.6 µs | Aggressive order sweeping a 1,000-order book |
-| `engine/accepted_new_limit` | 229 µs | 1,000 accepted orders on a fresh core: dedup, risk, book insert, report |
-| `engine/rejected_risk_check` | 173 µs | 1,000 orders ending in a risk rejection |
-| `engine/apply_generated_workload` | 1.50 ms | 10,000 mixed events, about 150 ns per event |
+| `codec/decode_one_frame` | 25.6 ns | One market-data frame, bounds- and CRC-checked |
+| `book/insert_1000` | 16.9 µs | 1,000 resting orders across 50 price levels |
+| `book/cancel_head` | 30.4 µs | 1,000 cancels by order id, O(1) unlink each |
+| `book/match_multi_level_sweep` | 17.1 µs | Aggressive order sweeping a 1,000-order book |
+| `engine/accepted_new_limit` | 157 µs | 1,000 accepted orders on a fresh core: dedup, risk, book insert, report |
+| `engine/rejected_risk_check` | 104 µs | 1,000 orders ending in a risk rejection |
+| `engine/apply_generated_workload` | 1.16 ms | 10,000 mixed events, about 116 ns per event |
+
+Dedup lookup, same filled window, indexed map versus a linear scan of the ring (the previous
+implementation). Indexed stays flat; scan grows with the window.
+
+| Window | Indexed | Scan |
+| --- | --- | --- |
+| 64 | 52.8 ns | 536 ns |
+| 256 | 52.6 ns | 1.80 µs |
+| 4,096 | 52.5 ns | 22.9 µs |
 
 The two engine benchmarks measure batches of 1,000 orders against a freshly prepared core, because
 a single long-lived core fills its 4,096-order capacity and starts rejecting. Each batch asserts
@@ -239,21 +251,24 @@ the command above. Workload: 200,000 generated events, 252,024 measured order re
 
 | Offered load | p50 | p99 | p99.9 | max | Throughput | Generator behind |
 | --- | --- | --- | --- | --- | --- | --- |
-| 100,000 msg/s | 750 ns [708–750] | 6.75 µs [6.58–7.17] | 30.3 µs [28.5–35.4] | 66.0 µs [56.9–91.6] | 99,998 msg/s | 331 of 200,000 |
-| 500,000 msg/s | 666 ns [666–667] | 8.71 µs [7.25–9.09] | 42.0 µs [36.7–44.6] | 87.0 µs [71.0–94.8] | 499,961 msg/s | 1,263 of 200,000 |
-| unpaced | 1.04 ms [1.02–1.05] | 1.21 ms [1.14–1.23] | 1.23 ms [1.16–1.29] | 1.23 ms [1.16–1.30] | 3,922,315 msg/s | 0 |
+| 100,000 msg/s | 583 ns [583–625] | 4.54 µs [3.71–6.92] | 33.2 µs [29.1–50.1] | 97.7 µs [83.9–680] | 99,997 msg/s | 319 of 200,000 |
+| 500,000 msg/s | 542 ns [541–584] | 3.54 µs [3.33–27.2] | 29.0 µs [24.7–584] | 65.3 µs [58.8–813] | 499,953 msg/s | 848 of 200,000 |
+| unpaced | 718 µs [713–725] | 979 µs [813–1,127] | 1.00 ms [0.837–1.15] | 1.01 ms [0.838–1.15] | 5,650,649 msg/s | 0 |
 
 **enqueue-to-report**
 
 | Offered load | p50 | p99 | p99.9 | max |
 | --- | --- | --- | --- | --- |
-| 100,000 msg/s | 709 ns [708–750] | 4.54 µs [4.42–4.71] | 27.0 µs [24.9–30.1] | 66.0 µs [55.9–84.5] |
-| 500,000 msg/s | 666 ns [666–667] | 5.63 µs [4.63–6.13] | 37.1 µs [29.8–39.8] | 79.4 µs [62.8–94.6] |
-| unpaced | 1.04 ms [1.02–1.05] | 1.21 ms [1.14–1.23] | 1.23 ms [1.16–1.29] | 1.23 ms [1.16–1.30] |
+| 100,000 msg/s | 583 ns [583–584] | 2.79 µs [2.13–4.75] | 26.0 µs [21.1–40.9] | 96.3 µs [83.9–680] |
+| 500,000 msg/s | 542 ns [541–542] | 1.96 µs [1.75–20.5] | 23.4 µs [19.1–536] | 58.4 µs [47.4–803] |
+| unpaced | 718 µs [713–725] | 979 µs [813–1,127] | 1.00 ms [0.837–1.15] | 1.01 ms [0.838–1.15] |
 
 The gap between the two tables is the producer falling behind its own schedule: at 500,000 msg/s the
-generator missed its slot 1,263 times, which moves p99 from 5.63 µs to 8.71 µs. Unpaced has no
-schedule, so the two boundaries are identical there.
+generator missed its slot 848 times (median; one run missed 2,611), which moves median p99 from
+1.96 µs to 3.54 µs. One of the five 500,000 msg/s runs was a tail outlier; the brackets are the
+lowest and highest run, not a trimmed set. Unpaced has no schedule, so the two boundaries are
+identical there. Queue high-water is a sampled approximation (every 64 successful pushes) and can
+lag the true depth by up to 63 events.
 
 The unpaced row is deliberately included: with an infinite offered load the queue stays full, so the
 measurement becomes queue residence, not coordination latency. That is why latency is only quoted at
@@ -274,9 +289,9 @@ generated events producing 5,261 inputs and 7,107 journal records; five measured
 
 | Journal mode | Throughput (median of 5) | Range | What it guarantees |
 | --- | --- | --- | --- |
-| `Buffered` | 1,091,786 msg/s | 618,522 – 1,095,746 | Flush when the buffer fills or the run ends |
-| `GroupCommit(64)` | 1,065,734 msg/s | 1,020,389 – 1,068,367 | Visible within 64 records or on queue drain, no `fsync` |
-| `Durable` | 228 msg/s | 226 – 228 | `fsync` per output event |
+| `Buffered` | 890,374 msg/s | 568,610 – 1,057,877 | Flush when the buffer fills or the run ends |
+| `GroupCommit(64)` | 1,097,604 msg/s | 990,049 – 1,129,676 | Visible within 64 records or on queue drain, no `fsync` |
+| `Durable` | 224 msg/s | 223 – 227 | `fsync` per output event |
 
 Durable acknowledgement costs roughly four thousand times the throughput of group commit on this
 laptop's filesystem. That is the honest price of one `fsync` per event, and it is why the gateway
@@ -286,9 +301,9 @@ uses group commit and states that it is a visibility bound rather than a durabil
 
 | Wait strategy | p50 | p99 | p99.9 |
 | --- | --- | --- | --- |
-| busy spin | 250 ns | 333 ns | 542 ns |
-| adaptive | 292 ns | 416 ns | 5.38 µs |
-| sleep | 80.0 µs | 166 µs | 171 µs |
+| busy spin | 250 ns | 334 ns | 542 ns |
+| adaptive | 250 ns | 334 ns | 625 ns |
+| sleep | 80.3 µs | 166 µs | 170 µs |
 
 The wait strategy dominates end-to-end latency at low load: an engine thread that parked wakes tens
 of microseconds late. Busy spin buys latency with a core, which is the trade a real venue makes.
@@ -299,12 +314,20 @@ of microseconds late. Busy spin buys latency with a core, which is the trade a r
 
 Two processes sit between an operator and the engine, and neither can slow it down.
 
-**Rust control gateway.** Tokio serves a local Unix socket using length-prefixed JSON. Every message
-carries a schema version and a command id, frames are bounded before parsing, and each response
-reports the engine sequence it was answered at. All 64- and 128-bit values cross the boundary as
-decimal strings, because JavaScript numbers cannot represent them exactly. Reads come from the
-journal and from periodic engine snapshots; mutations require a shared token and are refused
-outright when no token is configured.
+**Rust control gateway.** Tokio serves a local Unix socket using length-prefixed JSON. After bind
+the socket is mode `0600` (and a gateway-created parent directory is `0700`), so the mode does not
+depend on umask. Every message carries a schema version and a command id, frames are bounded before
+parsing, and each response reports the engine sequence it was answered at. All 64- and 128-bit
+values cross the boundary as decimal strings, because JavaScript numbers cannot represent them
+exactly. Reads come from the journal and from periodic engine snapshots. Mutations and sensitive
+reads (`snapshot`, `outputs`, replay status, journal reset) require a shared token compared in
+constant time and are refused outright when no token is configured. `health` stays unauthenticated
+because it carries no account or order state. The listener caps concurrent connections (default 32)
+and applies a per-read timeout (default 15s) so a half-open client cannot hold a task forever.
+
+Replay is a job, not a blocking request: `POST /replay/start` returns a job id immediately, the
+work runs on a dedicated thread rather than a Tokio worker, one job may run at a time, and only
+the latest 32 job records are retained.
 
 **Journal visibility and durability are different things, and the code keeps them apart.** The
 output thread writes CRC-framed records through a buffer, and `JournalSync` chooses when that buffer
@@ -338,11 +361,22 @@ request. It tails the gateway, applies the output stream to a SQLite projection,
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /book/:symbol` | Depth from the latest engine snapshot, with `asOfEngineSeq` |
-| `GET /orders`, `GET /trades`, `GET /positions` | Projected state, with the projection position |
+| `GET /orders`, `GET /trades`, `GET /positions` | Projected state, with the projection position and health |
 | `GET /settlements` | Settlement outbox status |
 | `GET /health`, `GET /metrics` | Health, and OpenMetrics exposition with bounded labels |
 | `POST /risk/limits`, `POST /engine/kill`, `POST /replay/start` | Bearer-authenticated operations |
+| `POST /projection/resync`, `POST /settlements/:id/release` | Rebuild the projection; requeue a proven-failed settlement |
 | `GET /stream` (WebSocket) | Projected events carrying a projection sequence for gap detection |
+
+`GET /health` is the only unauthenticated HTTP route. Book, orders, trades, positions, settlements,
+and metrics require a Bearer token compared in constant time. The WebSocket checks `bufferedAmount`
+before each send and closes the socket (1013) if it exceeds a configured threshold (default 1 MiB),
+so a slow client cannot accumulate an unbounded output buffer.
+
+The SQLite projection stores the engine `run_id` on trades and settlement identity. A restart on
+the same run resumes; a different run latches `run_mismatch` and stops applying until an explicit
+resync. A missing output sequence latches `degraded` the same way: later events do not clear it.
+Neither state is presented as fully healthy on `/health`, metrics, or projected reads.
 
 There is deliberately **no order entry** in the operational API. Operational tooling changes limits
 and stops trading; it does not send orders.
@@ -359,18 +393,27 @@ Settlement is a boundary, not a step in execution. **An executed trade stays exe
 settlement is delayed, unknown, or retried.**
 
 The projection groups unsettled trades into batches in a SQLite outbox. Each batch gets a settlement
-identity derived from its trade range and a canonical manifest hash over its contents. Retries reuse
-both, so a timeout can never create a second economic identity. That manifest hash is the outbox's
-own record of the batch; each venue additionally binds its settlement to the economics it actually
-applies, in the way that venue can prove — see below.
+identity derived from the engine run, its trade range, and a canonical manifest hash over its
+contents. Retries reuse both, so a timeout can never create a second economic identity. That
+manifest hash is the outbox's own record of the batch; each venue additionally binds its settlement
+to the economics it actually applies, in the way that venue can prove — see below.
 
 ```
 pending ──▶ submitted ──▶ confirmed        (terminal)
                     └──▶ unknown ──▶ submitted | confirmed | failed
+                    └──▶ unknown ──▶ needs_operator   (automatic retries exhausted)
 ```
 
-`unknown` is not a failure. A settlement is only marked failed when the venue rejected it, and a
-confirmation can never be undone by a later timeout.
+`unknown` is not a failure and is never rewritten to `failed`. A settlement is only marked failed
+when the venue rejected the batch before any economic effect. `unknown` retries use bounded
+exponential backoff with bounded jitter (base 500 ms, cap 60 s, eight automatic attempts). After
+that the row becomes `needs_operator` and stays economically unresolved. The pending query only
+returns rows whose `next_attempt_at` is due, so one stuck settlement does not head-of-line block
+newer work.
+
+A proven pre-submit rejection can be released and requeued by an operator. `unknown`, `confirmed`,
+and `needs_operator` cannot: those must not mint a second economic identity. A manifest conflict
+also goes to `needs_operator`.
 
 ### 🔷 Solana
 
@@ -421,6 +464,15 @@ duplicate stays idempotent. What this does not prove: nothing on the ledger link
 back to the individual trades, so a client that nets the wrong trades into well-formed legs would
 still settle.
 
+Debit on a holding requires both the operator and the owner; the operator cannot unilaterally
+reduce another party's balance. `Settle` still works because the instruction signatories authorize
+the nested debit. That is the authorization change this lab makes.
+
+What this does not do: the TypeScript venue still presents one process token that can act as every
+settling party, and every involved party observes the whole `SettlementInstruction`, including
+legs they are not on. A full Canton privacy or identity redesign is out of scope. Do not read the
+local sandbox as a confidential multi-party deployment.
+
 The `Holding` template is an explicit lab placeholder for a real holding, not a token standard
 implementation: the Canton Network Token Standard packages are not deployed on a plain sandbox, so
 this model settles against its own minimal holdings and would be pointed at the deployed standard on
@@ -452,11 +504,11 @@ What the suite actually checks:
   Nothing in the decoder is bypassed or reimplemented, and a unit test proves a real frame body
   survives that wrapper and decodes
 - **Threaded equivalence** — a three-thread run must reproduce the single-threaded replay digests
-- **Invariants** — reservations match live orders, positions net to zero, cumulative fills never
-  exceed the accepted total, output sequences never skip
+- **Invariants** — reservations match live orders after every command, positions equal signed
+  fills, cumulative fills never exceed the accepted total, output sequences never skip
 - **Failure injection** — gateway restart, silent gateway, corrupt journal tail, duplicate output,
   database restart mid-flight, venue unavailable, timeout after the venue applied a batch, manifest
-  conflict, and telemetry saturation
+  conflict, projection run-id mismatch, output-sequence gap, and telemetry saturation
 
 ---
 
@@ -496,8 +548,10 @@ fuzz/                   libFuzzer targets for the decoders
    output if the change is about performance, and say which machine produced it.
 6. CI must pass. It runs formatting, `cargo check`, Clippy with warnings denied, the full Rust test
    suite, replay verification against the golden fixtures, the fuzz target build, the TypeScript
-   typecheck, lint and tests, the Solana program against a local validator, and the Daml workflow
-   tests. No job depends on a public RPC endpoint, a public ledger, a paid API, or a secret.
+   typecheck, lint and tests, the Solana program and SolanaVenue tests against a local validator,
+   and the Daml workflow plus CantonVenue tests against a local sandbox and JSON API. Venue client
+   tests fail if the local service is missing; they do not skip. No job depends on a public RPC
+   endpoint, a public ledger, a paid API, or a secret.
 7. Squash or rebase so the merged history stays readable.
 
 ---

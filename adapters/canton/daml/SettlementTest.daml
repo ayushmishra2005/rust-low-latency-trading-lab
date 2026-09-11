@@ -186,6 +186,14 @@ testExactDuplicateSettlementIsIdempotent = do
   aliceAmount === 850
   bobAmount === 1150
 
+testOperatorCannotDebitUnilaterally : Script ()
+testOperatorCannotDebitUnilaterally = do
+  fixture <- setup
+  submitMustFail fixture.operator do
+    exerciseByKeyCmd @Holding (fixture.operator, fixture.alice) Debit with delta = 1
+  aliceAmount <- holdingAmount fixture.operator fixture.alice
+  aliceAmount === 1000
+
 testLegCountMustMatch : Script ()
 testLegCountMustMatch = do
   fixture <- setup

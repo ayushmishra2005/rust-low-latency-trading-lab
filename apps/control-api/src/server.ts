@@ -24,14 +24,34 @@ export interface Services {
 
 const decimalString = { type: 'string', pattern: '^[0-9]{1,39}$' } as const;
 
-/** Mutations require a bearer token. Reads are open on loopback. */
+function constantTimeEq(left: string, right: string): boolean {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  const len = Math.max(a.length, b.length);
+  let diff = a.length ^ b.length;
+  for (let index = 0; index < len; index += 1) {
+    diff |= (a[index] ?? 0) ^ (b[index] ?? 0);
+  }
+  return diff === 0;
+}
+
+function bearerToken(request: FastifyRequest): string | undefined {
+  const header = request.headers.authorization;
+  if (header !== undefined && header.startsWith('Bearer ')) {
+    return header.slice('Bearer '.length);
+  }
+  const query = (request.query as { token?: string } | undefined)?.token;
+  return typeof query === 'string' ? query : undefined;
+}
+
+/** Mutations and sensitive reads require a bearer token. Health stays open. */
 function authorize(services: Services, request: FastifyRequest): boolean {
   const expected = services.config.apiToken;
   if (expected === undefined) {
     return false;
   }
-  const header = request.headers.authorization;
-  return header === `Bearer ${expected}`;
+  const provided = bearerToken(request);
+  return provided !== undefined && constantTimeEq(provided, expected);
 }
 
 export function buildServer(services: Services): FastifyInstance {
@@ -56,8 +76,9 @@ export function buildServer(services: Services): FastifyInstance {
   });
 
   app.addHook('onRequest', async (request, reply) => {
-    const mutating = request.method === 'POST';
-    if (mutating && !authorize(services, request)) {
+    const path = request.url.split('?')[0] ?? request.url;
+    const open = request.method === 'GET' && (path === '/health' || path === '/health/');
+    if (!open && !authorize(services, request)) {
       await reply.code(401).send({ error: 'unauthorized' });
     }
   });
@@ -68,11 +89,18 @@ export function buildServer(services: Services): FastifyInstance {
   return app;
 }
 
-function position(services: Services): { asOfEngineSeq: string; projectionSeq: string } {
+function position(services: Services): {
+  asOfEngineSeq: string;
+  projectionSeq: string;
+  runId: string;
+  health: string;
+} {
   const state = services.projection.position;
   return {
     asOfEngineSeq: state.asOfEngineSeq.toString(),
     projectionSeq: state.projectionSeq.toString(),
+    runId: state.runId,
+    health: state.health,
   };
 }
 
@@ -85,10 +113,19 @@ function registerReadRoutes(app: FastifyInstance, services: Services): void {
     } catch (error) {
       gatewayError = error instanceof Error ? error.message : 'gateway unreachable';
     }
+    const projected = services.projection.position;
+    const projectionUnhealthy = projected.health !== 'healthy';
     return {
-      status: gateway === null ? 'degraded' : 'ok',
+      status:
+        gateway === null || projectionUnhealthy
+          ? projected.health === 'run_mismatch'
+            ? 'error'
+            : 'degraded'
+          : 'ok',
       ...position(services),
       projection: {
+        health: projected.health,
+        runId: projected.runId,
         eventsApplied: services.projection.counters.eventsApplied.toString(),
         gapsObserved: services.projection.counters.gapsObserved.toString(),
         pollErrors: services.projection.counters.pollErrors.toString(),
@@ -245,7 +282,7 @@ function registerReadRoutes(app: FastifyInstance, services: Services): void {
           properties: {
             status: {
               type: 'string',
-              enum: ['pending', 'submitted', 'unknown', 'confirmed', 'failed'],
+              enum: ['pending', 'submitted', 'unknown', 'confirmed', 'failed', 'needs_operator'],
             },
             limit: { type: 'integer', minimum: 1, maximum: 500, default: 100 },
           },
@@ -345,6 +382,36 @@ function registerControlRoutes(app: FastifyInstance, services: Services): void {
       return { ...result, ...position(services) };
     },
   );
+
+  app.post('/projection/resync', async () => {
+    await services.projection.rebuild();
+    return { accepted: true, ...position(services) };
+  });
+
+  app.post(
+    '/settlements/:id/release',
+    {
+      schema: {
+        params: {
+          type: 'object',
+          required: ['id'],
+          properties: { id: { type: 'string', minLength: 1, maxLength: 80 } },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      try {
+        services.outbox.releaseFailed(id);
+      } catch (error) {
+        return reply.code(409).send({
+          error: 'cannot_release',
+          message: error instanceof Error ? error.message : 'cannot release',
+        });
+      }
+      return { accepted: true, settlementId: id, ...position(services) };
+    },
+  );
 }
 
 /**
@@ -355,11 +422,21 @@ function registerStream(app: FastifyInstance, services: Services): void {
   // The websocket plugin must finish loading before the route is declared.
   void app.register(async (instance) => {
     await instance.register(websocket);
-    instance.get('/stream', { websocket: true }, (socket) => {
+    instance.get('/stream', { websocket: true }, (socket, request) => {
+      if (!authorize(services, request)) {
+        socket.close(1008, 'unauthorized');
+        return;
+      }
+      const threshold = services.config.wsMaxBufferedBytes ?? 1_048_576;
       const send = (payload: unknown): void => {
-        if (socket.readyState === socket.OPEN) {
-          socket.send(JSON.stringify(payload));
+        if (socket.readyState !== socket.OPEN) {
+          return;
         }
+        if (websocketWouldBlock(socket.bufferedAmount, threshold)) {
+          socket.close(1013, 'slow consumer');
+          return;
+        }
+        socket.send(JSON.stringify(payload));
       };
       send({ type: 'hello', ...position(services) });
       const listener = (event: unknown, projectionSeq: bigint): void => {
@@ -371,6 +448,10 @@ function registerStream(app: FastifyInstance, services: Services): void {
       });
     });
   });
+}
+
+export function websocketWouldBlock(bufferedAmount: number, threshold: number): boolean {
+  return bufferedAmount > threshold;
 }
 
 /** better-sqlite3 returns BigInt; JSON gets decimal strings. */

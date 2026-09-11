@@ -1,10 +1,10 @@
 //! Gateway state. The gateway never owns trading state: it reads durable
 //! output, caches the latest engine snapshot, and forwards control commands.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use engine_runtime::snapshot::EngineSnapshot;
@@ -24,7 +24,8 @@ pub struct Gateway {
     started: Instant,
     delivered_outputs: AtomicU64,
     last_output_seq: AtomicU64,
-    replay_jobs: Mutex<HashMap<String, Value>>,
+    replay_jobs: Arc<Mutex<VecDeque<(String, Value)>>>,
+    replay_busy: Arc<AtomicBool>,
     next_job: AtomicU64,
 }
 
@@ -39,7 +40,8 @@ impl Gateway {
             started: Instant::now(),
             delivered_outputs: AtomicU64::new(0),
             last_output_seq: AtomicU64::new(0),
-            replay_jobs: Mutex::new(HashMap::new()),
+            replay_jobs: Arc::new(Mutex::new(VecDeque::new())),
+            replay_busy: Arc::new(AtomicBool::new(false)),
             next_job: AtomicU64::new(0),
         }
     }
@@ -47,7 +49,10 @@ impl Gateway {
     pub fn authorized(&self, token: Option<&str>) -> bool {
         match &self.token {
             None => false,
-            Some(expected) => token == Some(expected.as_str()),
+            Some(expected) => match token {
+                Some(provided) => constant_time_eq(expected.as_bytes(), provided.as_bytes()),
+                None => false,
+            },
         }
     }
 
@@ -111,6 +116,10 @@ impl Gateway {
         let engine_ready = snapshot.is_some();
         json!({
             "status": if engine_ready { "ready" } else { "starting" },
+            "runId": snapshot
+                .as_ref()
+                .map(|value| value.run_id.to_string())
+                .unwrap_or_else(|| "0".to_string()),
             "uptimeSeconds": self.started.elapsed().as_secs(),
             "journalPath": self.journal_path.display().to_string(),
             "deliveredOutputs": self.delivered_outputs.load(Ordering::Relaxed).to_string(),
@@ -183,43 +192,101 @@ impl Gateway {
         }
     }
 
-    /// Replay runs on an isolated core. It never touches the live engine.
+    pub fn reset_journal_tail(&self) {
+        *self.tail.lock().expect("tail mutex") = None;
+    }
+
+    /// Returns immediately. The work runs on a dedicated thread, not a Tokio worker.
     pub fn start_replay(&self, seed: u64, events: usize) -> Value {
         let job_id = format!(
             "replay-{}",
             self.next_job.fetch_add(1, Ordering::Relaxed) + 1
         );
-        let inputs = Generator::new(GeneratorConfig::new(seed, events)).generate();
-        let mut replay = Replay::new(
-            TradingCore::new(EngineConfig::single_instrument(u128::from(seed))),
-            1_000,
-        );
-        replay.run(&inputs);
-        let result = replay.finish();
-        let value = json!({
+        if self.replay_busy.swap(true, Ordering::AcqRel) {
+            return json!({
+                "jobId": job_id,
+                "status": "rejected",
+                "reason": "replay already running",
+            });
+        }
+        let running = json!({
             "jobId": job_id,
-            "status": "completed",
+            "status": "running",
             "seed": seed.to_string(),
             "events": events.to_string(),
-            "inputs": result.inputs.to_string(),
-            "outputs": result.outputs.to_string(),
-            "inputDigest": digest_hex(&result.input_digest),
-            "outputDigest": digest_hex(&result.output_digest),
-            "stateDigest": digest_hex(&result.state_digest),
-            "checkpoints": result.checkpoints.len(),
         });
-        self.replay_jobs
-            .lock()
-            .expect("replay mutex")
-            .insert(job_id, value.clone());
-        value
+        {
+            let mut jobs = self.replay_jobs.lock().expect("replay mutex");
+            jobs.push_back((job_id.clone(), running.clone()));
+            while jobs.len() > 32 {
+                jobs.pop_front();
+            }
+        }
+        let jobs = Arc::clone(&self.replay_jobs);
+        let busy = Arc::clone(&self.replay_busy);
+        let stored_id = job_id.clone();
+        std::thread::Builder::new()
+            .name(job_id.clone())
+            .spawn(move || {
+                let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let inputs = Generator::new(GeneratorConfig::new(seed, events)).generate();
+                    let mut replay = Replay::new(
+                        TradingCore::new(EngineConfig::single_instrument(u128::from(seed))),
+                        1_000,
+                    );
+                    replay.run(&inputs);
+                    let result = replay.finish();
+                    json!({
+                        "jobId": stored_id,
+                        "status": "completed",
+                        "seed": seed.to_string(),
+                        "events": events.to_string(),
+                        "inputs": result.inputs.to_string(),
+                        "outputs": result.outputs.to_string(),
+                        "inputDigest": digest_hex(&result.input_digest),
+                        "outputDigest": digest_hex(&result.output_digest),
+                        "stateDigest": digest_hex(&result.state_digest),
+                        "checkpoints": result.checkpoints.len(),
+                    })
+                }))
+                .unwrap_or_else(|_| {
+                    json!({
+                        "jobId": stored_id,
+                        "status": "failed",
+                        "reason": "replay panicked",
+                    })
+                });
+                if let Some(entry) = jobs
+                    .lock()
+                    .expect("replay mutex")
+                    .iter_mut()
+                    .find(|(id, _)| *id == stored_id)
+                {
+                    entry.1 = value;
+                }
+                busy.store(false, Ordering::Release);
+            })
+            .expect("replay worker");
+        running
     }
 
     pub fn replay_status(&self, job_id: &str) -> Option<Value> {
         self.replay_jobs
             .lock()
             .expect("replay mutex")
-            .get(job_id)
-            .cloned()
+            .iter()
+            .find(|(id, _)| id == job_id)
+            .map(|(_, value)| value.clone())
     }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for index in 0..len {
+        diff |= usize::from(
+            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
+        );
+    }
+    diff == 0
 }

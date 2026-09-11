@@ -53,6 +53,7 @@ pub struct PositionSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineSnapshot {
+    pub run_id: u128,
     pub as_of_engine_seq: EngineSeq,
     pub engine_time_ns: u64,
     pub global_kill: bool,
@@ -128,6 +129,7 @@ pub fn capture(core: &TradingCore, depth: usize) -> EngineSnapshot {
     }
 
     EngineSnapshot {
+        run_id: core.config().run_id,
         as_of_engine_seq: core.engine_seq(),
         engine_time_ns: core.engine_time_ns(),
         global_kill: core.global_kill(),

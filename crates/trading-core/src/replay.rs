@@ -275,6 +275,8 @@ pub fn state_digest(core: &TradingCore) -> Digest {
     section(&mut buffer, SECTION_HEADER, 0);
     buffer.extend_from_slice(&STATE_SCHEMA_VERSION.to_le_bytes());
     buffer.extend_from_slice(&core.config().run_id.to_le_bytes());
+    buffer.extend_from_slice(&(core.config().max_market_depth as u64).to_le_bytes());
+    buffer.extend_from_slice(&(core.config().dedup_window as u64).to_le_bytes());
     buffer.extend_from_slice(&core.engine_seq().0.to_le_bytes());
     buffer.extend_from_slice(&core.output_seq().0.to_le_bytes());
     buffer.extend_from_slice(&core.engine_time_ns().to_le_bytes());

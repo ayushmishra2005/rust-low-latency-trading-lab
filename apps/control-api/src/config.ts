@@ -7,6 +7,7 @@ export interface Config {
   apiToken: string | undefined;
   pollIntervalMs: number;
   settlementBatchSize: number;
+  wsMaxBufferedBytes?: number;
 }
 
 /** Defaults bind to loopback. Nothing here reads secrets from disk. */
@@ -20,5 +21,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     apiToken: env.RLTL_API_TOKEN,
     pollIntervalMs: Number.parseInt(env.RLTL_POLL_INTERVAL_MS ?? '100', 10),
     settlementBatchSize: Number.parseInt(env.RLTL_SETTLEMENT_BATCH ?? '50', 10),
+    wsMaxBufferedBytes: Number.parseInt(env.RLTL_WS_MAX_BUFFERED ?? '1048576', 10),
   };
 }

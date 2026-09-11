@@ -8,7 +8,7 @@ import type Database from 'better-sqlite3';
 import { openDatabase } from '../src/db.js';
 import { manifestHash, settlementIdFor } from '../src/settlement/manifest.js';
 import { SettlementDispatcher } from '../src/settlement/dispatcher.js';
-import { SettlementOutbox } from '../src/settlement/outbox.js';
+import { backoffMs, MAX_AUTO_ATTEMPTS, SettlementOutbox } from '../src/settlement/outbox.js';
 import { SimulatedVenue } from '../src/settlement/simulated.js';
 import { buildVenue } from '../src/settlement/venue.js';
 
@@ -20,6 +20,7 @@ interface Fixture {
   venue: SimulatedVenue;
   dispatcher: SettlementDispatcher;
   file: string;
+  advance: (ms?: number) => void;
 }
 
 function fixture(name: string, trades = 3): Fixture {
@@ -29,7 +30,18 @@ function fixture(name: string, trades = 3): Fixture {
   insertTrades(db, trades);
   const venue = new SimulatedVenue();
   const outbox = new SettlementOutbox(db, venue.venue);
-  return { db, outbox, venue, dispatcher: new SettlementDispatcher(outbox, venue, 100), file };
+  let now = 1_700_000_000_000;
+  outbox.nowMs = () => now;
+  return {
+    db,
+    outbox,
+    venue,
+    dispatcher: new SettlementDispatcher(outbox, venue, 100),
+    file,
+    advance: (ms = 60_000) => {
+      now += ms;
+    },
+  };
 }
 
 function insertTrades(db: Database.Database, count: number, from = 1): void {
@@ -92,7 +104,7 @@ test('a confirmed settlement is terminal', async () => {
 });
 
 test('a timeout after the venue applied the batch resolves to the original receipt', async () => {
-  const { outbox, venue, dispatcher } = fixture('timeout');
+  const { outbox, venue, dispatcher, advance } = fixture('timeout');
   venue.faults.timeoutAfterApply = true;
   await dispatcher.tick();
 
@@ -100,6 +112,7 @@ test('a timeout after the venue applied the batch resolves to the original recei
   assert.equal(outbox.get(settlementId)!.status, 'unknown');
 
   venue.faults.timeoutAfterApply = false;
+  advance();
   await dispatcher.tick();
 
   const row = outbox.get(settlementId)!;
@@ -110,9 +123,10 @@ test('a timeout after the venue applied the batch resolves to the original recei
 });
 
 test('an unavailable venue leaves the settlement retryable and the trades intact', async () => {
-  const { outbox, venue, dispatcher, db } = fixture('unavailable');
+  const { outbox, venue, dispatcher, db, advance } = fixture('unavailable');
   venue.faults.unavailable = true;
   await dispatcher.tick();
+  advance();
   await dispatcher.tick();
 
   const settlementId = settlementIdFor('simulated', 1n, 3n);
@@ -121,6 +135,7 @@ test('an unavailable venue leaves the settlement retryable and the trades intact
   assert.equal(trades.total, 3n, 'an executed trade stays executed while settlement is delayed');
 
   venue.faults.unavailable = false;
+  advance();
   await dispatcher.tick();
   assert.equal(outbox.get(settlementId)!.status, 'confirmed');
 });
@@ -143,7 +158,7 @@ test('the same settlement id with a different manifest is refused', async () => 
   assert.throws(() => outbox.manifestFor(row.settlementId), /different manifest/);
 
   await dispatcher.tick();
-  assert.equal(outbox.get(row.settlementId)!.status, 'failed');
+  assert.equal(outbox.get(row.settlementId)!.status, 'needs_operator');
   assert.equal(dispatcher.counters.manifestConflicts, 1n);
 });
 
@@ -155,6 +170,7 @@ test('the outbox survives a database restart mid-flight', async () => {
 
   const reopened = openDatabase(file);
   const resumedOutbox = new SettlementOutbox(reopened, venue.venue);
+  resumedOutbox.makeDue();
   const resumed = new SettlementDispatcher(resumedOutbox, venue, 100);
   venue.faults.unavailable = false;
   await resumed.tick();
@@ -166,4 +182,86 @@ test('the outbox survives a database restart mid-flight', async () => {
   };
   assert.equal(settlements.total, 1n, 'recovery must not create a second settlement identity');
   reopened.close();
+});
+
+test('an unknown settlement does not head-of-line block a later batch', async () => {
+  const { outbox, venue, dispatcher, db } = fixture('hol', 3);
+  venue.faults.unavailable = true;
+  await dispatcher.tick();
+  const firstId = settlementIdFor('simulated', 1n, 3n);
+  assert.equal(outbox.get(firstId)!.status, 'unknown');
+  assert.equal(outbox.pending(10).length, 0);
+
+  insertTrades(db, 3, 4);
+  venue.faults.unavailable = false;
+  await dispatcher.tick();
+
+  const laterId = settlementIdFor('simulated', 4n, 6n);
+  assert.equal(outbox.get(laterId)!.status, 'confirmed');
+  assert.equal(outbox.get(firstId)!.status, 'unknown');
+});
+
+test('unknown retry backoff increases and then needs an operator', async () => {
+  const { outbox, venue, dispatcher, advance } = fixture('backoff');
+  venue.faults.unavailable = true;
+  await dispatcher.tick();
+  const settlementId = settlementIdFor('simulated', 1n, 3n);
+  const first = outbox.get(settlementId)!;
+  assert.equal(first.status, 'unknown');
+  const firstDelay = Number(first.nextAttemptAtMs) - 1_700_000_000_000;
+  assert.ok(firstDelay >= backoffMs(1) - 1);
+
+  advance(firstDelay);
+  await dispatcher.tick();
+  const second = outbox.get(settlementId)!;
+  assert.equal(second.status, 'unknown');
+  assert.ok(Number(second.attempts) > Number(first.attempts));
+  assert.ok(backoffMs(Number(second.attempts)) > backoffMs(Number(first.attempts)));
+
+  for (let attempt = Number(second.attempts); attempt < MAX_AUTO_ATTEMPTS; attempt += 1) {
+    outbox.makeDue();
+    await dispatcher.tick();
+  }
+  const final = outbox.get(settlementId)!;
+  assert.equal(final.status, 'needs_operator');
+  assert.notEqual(final.status, 'failed');
+  assert.equal(outbox.pending(10).length, 0);
+});
+
+test('a proven reject can be released and claimed again', async () => {
+  const { outbox, venue, dispatcher } = fixture('release');
+  venue.faults.reject = true;
+  await dispatcher.tick();
+  const settlementId = settlementIdFor('simulated', 1n, 3n);
+  assert.equal(outbox.get(settlementId)!.status, 'failed');
+  outbox.releaseFailed(settlementId);
+  assert.equal(outbox.get(settlementId), null);
+
+  venue.faults.reject = false;
+  const again = outbox.createBatch(10);
+  assert.notEqual(again, null);
+  assert.equal(again!.settlementId, settlementId);
+  await dispatcher.tick();
+  assert.equal(outbox.get(settlementId)!.status, 'confirmed');
+});
+
+test('unknown, confirmed, and operator states cannot be requeued', async () => {
+  const unknown = fixture('no-requeue-unknown');
+  unknown.venue.faults.unavailable = true;
+  await unknown.dispatcher.tick();
+  const unknownId = settlementIdFor('simulated', 1n, 3n);
+  assert.throws(() => unknown.outbox.releaseFailed(unknownId), /cannot be requeued/);
+
+  const confirmed = fixture('no-requeue-confirmed');
+  await confirmed.dispatcher.tick();
+  const confirmedId = settlementIdFor('simulated', 1n, 3n);
+  assert.equal(confirmed.outbox.get(confirmedId)!.status, 'confirmed');
+  assert.throws(() => confirmed.outbox.releaseFailed(confirmedId), /cannot be requeued/);
+
+  const conflict = fixture('no-requeue-conflict');
+  const row = conflict.outbox.createBatch(10)!;
+  conflict.db.prepare('UPDATE trades SET quantity_lots = 99 WHERE trade_id = 1').run();
+  await conflict.dispatcher.tick();
+  assert.equal(conflict.outbox.get(row.settlementId)!.status, 'needs_operator');
+  assert.throws(() => conflict.outbox.releaseFailed(row.settlementId), /cannot be requeued/);
 });

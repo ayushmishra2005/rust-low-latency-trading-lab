@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { readStateText } from '../db.js';
 import { canonicalManifestBytes, manifestHash, settlementIdFor } from './manifest.js';
 import type { Manifest, ManifestTrade } from './manifest.js';
 
@@ -7,11 +8,29 @@ import type { Manifest, ManifestTrade } from './manifest.js';
  *
  * pending -> submitted -> confirmed
  *                     \-> unknown -> submitted | confirmed | failed
+ *                     \-> unknown -> needs_operator   (retries exhausted)
  *
  * UNKNOWN is not a failure. A settlement only becomes failed when the venue
- * rejected it, and confirmed is terminal.
+ * rejected it. needs_operator means automatic retries stopped; the economic
+ * outcome is still unresolved. confirmed is terminal.
  */
-export type SettlementStatus = 'pending' | 'submitted' | 'unknown' | 'confirmed' | 'failed';
+export type SettlementStatus =
+  | 'pending'
+  | 'submitted'
+  | 'unknown'
+  | 'confirmed'
+  | 'failed'
+  | 'needs_operator';
+
+export const MAX_AUTO_ATTEMPTS = 8;
+export const BASE_BACKOFF_MS = 500;
+export const MAX_BACKOFF_MS = 60_000;
+
+export function backoffMs(attempts: number): number {
+  const exp = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** Math.min(Math.max(attempts, 1), 10));
+  const jitter = Math.floor((exp * ((attempts * 37) % 10)) / 100);
+  return exp + jitter;
+}
 
 export interface SettlementRow {
   settlementId: string;
@@ -22,6 +41,7 @@ export interface SettlementRow {
   lastTradeId: bigint;
   tradeCount: bigint;
   attempts: bigint;
+  nextAttemptAtMs: bigint;
   receipt: string | null;
   lastError: string | null;
 }
@@ -42,6 +62,7 @@ interface RawRow {
   last_trade_id: bigint;
   trade_count: bigint;
   attempts: bigint;
+  next_attempt_at_ms: bigint;
   receipt: string | null;
   last_error: string | null;
 }
@@ -56,12 +77,15 @@ function toRow(raw: RawRow): SettlementRow {
     lastTradeId: raw.last_trade_id,
     tradeCount: raw.trade_count,
     attempts: raw.attempts,
+    nextAttemptAtMs: raw.next_attempt_at_ms ?? 0n,
     receipt: raw.receipt,
     lastError: raw.last_error,
   };
 }
 
 export class SettlementOutbox {
+  nowMs = (): number => Date.now();
+
   constructor(
     private readonly db: Database.Database,
     private readonly venue: string,
@@ -94,7 +118,8 @@ export class SettlementOutbox {
 
       const first = rows[0]!.trade_id;
       const last = rows[rows.length - 1]!.trade_id;
-      const settlementId = settlementIdFor(this.venue, first, last);
+      const runId = readStateText(this.db, 'run_id') || '0';
+      const settlementId = settlementIdFor(this.venue, first, last, runId);
       const trades: ManifestTrade[] = rows.map((row) => ({
         tradeId: row.trade_id.toString(),
         instrument: Number(row.instrument),
@@ -124,8 +149,8 @@ export class SettlementOutbox {
         .prepare(
           `INSERT INTO settlements
              (settlement_id, venue, status, manifest_hash, first_trade_id, last_trade_id,
-              trade_count, attempts, receipt, last_error, created_at_ms, updated_at_ms)
-           VALUES (?, ?, 'pending', ?, ?, ?, ?, 0, NULL, NULL, ?, ?)
+              trade_count, attempts, next_attempt_at_ms, receipt, last_error, created_at_ms, updated_at_ms)
+           VALUES (?, ?, 'pending', ?, ?, ?, ?, 0, 0, NULL, NULL, ?, ?)
            ON CONFLICT (settlement_id) DO NOTHING`,
         )
         .run(settlementId, this.venue, hash, first, last, BigInt(rows.length), now, now);
@@ -198,15 +223,27 @@ export class SettlementOutbox {
   }
 
   pending(limit: number): SettlementRow[] {
+    const now = BigInt(this.nowMs());
     const raws = this.db
       .prepare(
         `SELECT * FROM settlements
           WHERE status IN ('pending', 'submitted', 'unknown')
+            AND next_attempt_at_ms <= ?
           ORDER BY first_trade_id
           LIMIT ?`,
       )
-      .all(BigInt(limit)) as RawRow[];
+      .all(now, BigInt(limit)) as RawRow[];
     return raws.map(toRow);
+  }
+
+  makeDue(settlementId?: string): void {
+    if (settlementId === undefined) {
+      this.db.prepare('UPDATE settlements SET next_attempt_at_ms = 0').run();
+      return;
+    }
+    this.db
+      .prepare('UPDATE settlements SET next_attempt_at_ms = 0 WHERE settlement_id = ?')
+      .run(settlementId);
   }
 
   countByStatus(): Record<SettlementStatus, bigint> {
@@ -216,6 +253,7 @@ export class SettlementOutbox {
       unknown: 0n,
       confirmed: 0n,
       failed: 0n,
+      needs_operator: 0n,
     };
     const rows = this.db
       .prepare('SELECT status, COUNT(*) AS total FROM settlements GROUP BY status')
@@ -227,25 +265,73 @@ export class SettlementOutbox {
   }
 
   recordAttempt(settlementId: string): void {
-    this.transition(settlementId, 'submitted', { attempt: true });
+    this.transition(settlementId, 'submitted', { nextAttemptAtMs: 0n });
   }
 
   recordConfirmed(settlementId: string, receipt: string): void {
-    this.transition(settlementId, 'confirmed', { receipt });
+    this.transition(settlementId, 'confirmed', { receipt, nextAttemptAtMs: 0n });
   }
 
   recordUnknown(settlementId: string, error: string): void {
-    this.transition(settlementId, 'unknown', { error });
+    const current = this.get(settlementId);
+    if (current === null) {
+      throw new Error(`unknown settlement ${settlementId}`);
+    }
+    if (current.status === 'confirmed' || current.status === 'failed') {
+      return;
+    }
+    const attempts = Number(current.attempts) + 1;
+    if (attempts >= MAX_AUTO_ATTEMPTS) {
+      this.transition(settlementId, 'needs_operator', {
+        error,
+        increment: true,
+        nextAttemptAtMs: BigInt(Number.MAX_SAFE_INTEGER),
+      });
+      return;
+    }
+    const nextAttemptAtMs = BigInt(this.nowMs() + backoffMs(attempts));
+    this.transition(settlementId, 'unknown', { error, increment: true, nextAttemptAtMs });
   }
 
   recordFailed(settlementId: string, error: string): void {
-    this.transition(settlementId, 'failed', { error });
+    this.transition(settlementId, 'failed', { error, nextAttemptAtMs: 0n });
+  }
+
+  recordNeedsOperator(settlementId: string, error: string): void {
+    this.transition(settlementId, 'needs_operator', {
+      error,
+      nextAttemptAtMs: BigInt(Number.MAX_SAFE_INTEGER),
+    });
+  }
+
+  /**
+   * Proven non-economic failure only. Releases trades so they can be claimed
+   * again. Never used for UNKNOWN or a confirmed settlement.
+   */
+  releaseFailed(settlementId: string): void {
+    const current = this.get(settlementId);
+    if (current === null) {
+      throw new Error(`unknown settlement ${settlementId}`);
+    }
+    if (current.status !== 'failed') {
+      throw new Error(`settlement ${settlementId} is ${current.status} and cannot be requeued`);
+    }
+    const release = this.db.transaction((id: string) => {
+      this.db.prepare('UPDATE trades SET settlement_id = NULL WHERE settlement_id = ?').run(id);
+      this.db.prepare('DELETE FROM settlements WHERE settlement_id = ?').run(id);
+    });
+    release(settlementId);
   }
 
   private transition(
     settlementId: string,
     next: SettlementStatus,
-    options: { receipt?: string; error?: string; attempt?: boolean },
+    options: {
+      receipt?: string;
+      error?: string;
+      increment?: boolean;
+      nextAttemptAtMs?: bigint;
+    },
   ): void {
     const current = this.get(settlementId);
     if (current === null) {
@@ -258,11 +344,13 @@ export class SettlementOutbox {
     if (current.status === 'failed' && next !== 'confirmed') {
       return;
     }
+    const now = BigInt(this.nowMs());
     this.db
       .prepare(
         `UPDATE settlements
             SET status = ?,
                 attempts = attempts + ?,
+                next_attempt_at_ms = ?,
                 receipt = COALESCE(?, receipt),
                 last_error = ?,
                 updated_at_ms = ?
@@ -270,10 +358,11 @@ export class SettlementOutbox {
       )
       .run(
         next,
-        options.attempt === true ? 1n : 0n,
+        options.increment === true ? 1n : 0n,
+        options.nextAttemptAtMs ?? 0n,
         options.receipt ?? null,
         options.error ?? null,
-        BigInt(Date.now()),
+        now,
         settlementId,
       );
   }

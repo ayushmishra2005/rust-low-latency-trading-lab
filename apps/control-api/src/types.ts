@@ -69,6 +69,7 @@ export interface InstrumentSnapshot {
 }
 
 export interface EngineSnapshot {
+  runId?: string;
   asOfEngineSeq: string;
   engineTimeNs: string;
   globalKill: boolean;
@@ -87,6 +88,7 @@ export interface EngineSnapshot {
 
 export interface GatewayHealth {
   status: string;
+  runId?: string;
   uptimeSeconds: number;
   journalPath: string;
   deliveredOutputs: string;

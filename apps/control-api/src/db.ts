@@ -36,8 +36,9 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS orders_by_account ON orders (account, state);
 
 CREATE TABLE IF NOT EXISTS trades (
-  trade_id      INTEGER PRIMARY KEY,
-  output_seq    INTEGER NOT NULL UNIQUE,
+  run_id        TEXT    NOT NULL DEFAULT '0',
+  trade_id      INTEGER NOT NULL,
+  output_seq    INTEGER NOT NULL,
   engine_seq    INTEGER NOT NULL,
   engine_time_ns INTEGER NOT NULL,
   instrument    INTEGER NOT NULL,
@@ -46,7 +47,9 @@ CREATE TABLE IF NOT EXISTS trades (
   aggressor     TEXT    NOT NULL,
   price_ticks   INTEGER NOT NULL,
   quantity_lots INTEGER NOT NULL,
-  settlement_id TEXT REFERENCES settlements (settlement_id)
+  settlement_id TEXT REFERENCES settlements (settlement_id),
+  PRIMARY KEY (run_id, trade_id),
+  UNIQUE (run_id, output_seq)
 );
 CREATE INDEX IF NOT EXISTS trades_unsettled ON trades (settlement_id, trade_id);
 
@@ -65,27 +68,38 @@ CREATE TABLE IF NOT EXISTS risk_rejects (
 );
 
 CREATE TABLE IF NOT EXISTS settlements (
-  settlement_id  TEXT PRIMARY KEY,
-  venue          TEXT    NOT NULL,
-  status         TEXT    NOT NULL,
-  manifest_hash  TEXT    NOT NULL,
-  first_trade_id INTEGER NOT NULL,
-  last_trade_id  INTEGER NOT NULL,
-  trade_count    INTEGER NOT NULL,
-  attempts       INTEGER NOT NULL DEFAULT 0,
-  receipt        TEXT,
-  last_error     TEXT,
-  created_at_ms  INTEGER NOT NULL,
-  updated_at_ms  INTEGER NOT NULL
+  settlement_id      TEXT PRIMARY KEY,
+  venue              TEXT    NOT NULL,
+  status             TEXT    NOT NULL,
+  manifest_hash      TEXT    NOT NULL,
+  first_trade_id     INTEGER NOT NULL,
+  last_trade_id      INTEGER NOT NULL,
+  trade_count        INTEGER NOT NULL,
+  attempts           INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+  receipt            TEXT,
+  last_error         TEXT,
+  created_at_ms      INTEGER NOT NULL,
+  updated_at_ms      INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS settlements_by_status ON settlements (status, settlement_id);
+CREATE INDEX IF NOT EXISTS settlements_by_status ON settlements (status, next_attempt_at_ms, settlement_id);
 `;
 
 function migrate(db: Database.Database): void {
   db.exec(SCHEMA);
+  addColumn(db, 'settlements', 'next_attempt_at_ms', 'INTEGER NOT NULL DEFAULT 0');
   db.prepare("INSERT OR IGNORE INTO projection_state (key, value) VALUES ('last_output_seq', '0')").run();
   db.prepare("INSERT OR IGNORE INTO projection_state (key, value) VALUES ('as_of_engine_seq', '0')").run();
   db.prepare("INSERT OR IGNORE INTO projection_state (key, value) VALUES ('projection_seq', '0')").run();
+  db.prepare("INSERT OR IGNORE INTO projection_state (key, value) VALUES ('run_id', '0')").run();
+  db.prepare("INSERT OR IGNORE INTO projection_state (key, value) VALUES ('projection_health', 'healthy')").run();
+}
+
+function addColumn(db: Database.Database, table: string, column: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!columns.some((entry) => entry.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }
 
 export function readState(db: Database.Database, key: string): bigint {
@@ -95,6 +109,13 @@ export function readState(db: Database.Database, key: string): bigint {
   return row === undefined ? 0n : BigInt(row.value);
 }
 
-export function writeState(db: Database.Database, key: string, value: bigint): void {
+export function writeState(db: Database.Database, key: string, value: bigint | string): void {
   db.prepare('UPDATE projection_state SET value = ? WHERE key = ?').run(value.toString(), key);
+}
+
+export function readStateText(db: Database.Database, key: string): string {
+  const row = db.prepare('SELECT value FROM projection_state WHERE key = ?').get(key) as
+    | { value: string }
+    | undefined;
+  return row === undefined ? '' : row.value;
 }

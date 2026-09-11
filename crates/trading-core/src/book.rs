@@ -25,8 +25,12 @@ pub struct OrderNode {
 
 impl OrderNode {
     pub fn remaining(&self) -> QuantityLots {
-        // Invariant: cumulative fill never exceeds the accepted total.
-        QuantityLots(self.total_quantity.0 - self.cumulative_filled.0)
+        QuantityLots(
+            self.total_quantity
+                .0
+                .checked_sub(self.cumulative_filled.0)
+                .expect("accounting: cumulative fill exceeded total"),
+        )
     }
 }
 
@@ -101,7 +105,24 @@ impl OrderBook {
         if self.is_full() {
             return Err(CapacityExhausted);
         }
-        let remaining = order.total_quantity.0 - order.cumulative_filled.0;
+        let remaining = order
+            .total_quantity
+            .0
+            .checked_sub(order.cumulative_filled.0)
+            .ok_or(CapacityExhausted)?;
+        {
+            let levels = match order.side {
+                Side::Buy => &self.bids,
+                Side::Sell => &self.asks,
+            };
+            if let Some(level) = levels.get(&order.price) {
+                if level.total_remaining.checked_add(remaining).is_none()
+                    || level.order_count.checked_add(1).is_none()
+                {
+                    return Err(CapacityExhausted);
+                }
+            }
+        }
         let slot = self.orders.insert(OrderNode {
             order_id: order.order_id,
             account: order.account,
@@ -158,8 +179,11 @@ impl OrderBook {
             Some(next) => self.orders[next].prev = node.prev,
             None => level.tail = node.prev,
         }
-        level.order_count -= 1;
-        level.total_remaining -= node.remaining().0;
+        level.order_count = level.order_count.saturating_sub(1);
+        level.total_remaining = level
+            .total_remaining
+            .checked_sub(node.remaining().0)
+            .expect("accounting: level remaining underflow");
         if level.order_count == 0 {
             levels.remove(&node.price);
         }
@@ -180,14 +204,23 @@ impl OrderBook {
             Side::Sell => &mut self.asks,
         };
         if let Some(level) = levels.get_mut(&price) {
-            level.total_remaining = level.total_remaining - old_remaining + new_remaining;
+            level.total_remaining = level
+                .total_remaining
+                .checked_sub(old_remaining)
+                .and_then(|total| total.checked_add(new_remaining))
+                .expect("accounting: level remaining overflow");
         }
     }
 
     /// Applies a fill to a resting order and removes it when fully filled.
     pub(crate) fn fill_maker(&mut self, slot: usize, quantity: QuantityLots) -> OrderNode {
         let node = &mut self.orders[slot];
-        node.cumulative_filled = QuantityLots(node.cumulative_filled.0 + quantity.0);
+        node.cumulative_filled = QuantityLots(
+            node.cumulative_filled
+                .0
+                .checked_add(quantity.0)
+                .expect("accounting: cumulative fill overflow"),
+        );
         let filled_out = node.remaining().is_zero();
         let node_copy = *node;
         let (side, price) = (node_copy.side, node_copy.price);
@@ -196,7 +229,10 @@ impl OrderBook {
             Side::Sell => &mut self.asks,
         };
         if let Some(level) = levels.get_mut(&price) {
-            level.total_remaining -= quantity.0;
+            level.total_remaining = level
+                .total_remaining
+                .checked_sub(quantity.0)
+                .expect("accounting: level remaining underflow");
         }
         if filled_out {
             self.index.remove(&node_copy.order_id);

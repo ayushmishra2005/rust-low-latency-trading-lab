@@ -134,6 +134,88 @@ fn checkpoints_locate_the_first_divergence() {
     }
 }
 
+fn assert_reservations_match_live_orders(core: &TradingCore) {
+    let mut expected: HashMap<(u32, usize, Side), (u64, u128)> = HashMap::new();
+    for (instrument_index, instrument) in core.instruments().iter().enumerate() {
+        for (side, price, orders) in instrument.book.snapshot() {
+            for order in orders {
+                let remaining = order.remaining().0;
+                let notional = u128::from(remaining) * u128::from(price.0.unsigned_abs());
+                let entry = expected
+                    .entry((order.account.0, instrument_index, side))
+                    .or_default();
+                entry.0 += remaining;
+                entry.1 += notional;
+            }
+        }
+    }
+    for account in core.accounts() {
+        for (instrument_index, position) in account.positions.iter().enumerate() {
+            let buys = expected
+                .get(&(account.id.0, instrument_index, Side::Buy))
+                .copied()
+                .unwrap_or((0, 0));
+            let sells = expected
+                .get(&(account.id.0, instrument_index, Side::Sell))
+                .copied()
+                .unwrap_or((0, 0));
+            assert_eq!(position.open_buy_lots, buys.0, "buy reservation mismatch");
+            assert_eq!(
+                position.open_sell_lots, sells.0,
+                "sell reservation mismatch"
+            );
+            assert_eq!(position.open_buy_notional, buys.1, "buy notional mismatch");
+            assert_eq!(
+                position.open_sell_notional, sells.1,
+                "sell notional mismatch"
+            );
+        }
+    }
+}
+
+fn assert_positions_match_fills(core: &TradingCore, fills: &HashMap<(u32, u32), i64>) {
+    for account in core.accounts() {
+        for (instrument_index, position) in account.positions.iter().enumerate() {
+            let instrument = core.instruments()[instrument_index].config.id.0;
+            let expected = fills.get(&(account.id.0, instrument)).copied().unwrap_or(0);
+            assert_eq!(
+                position.position_lots, expected,
+                "position {} on {} != signed fills",
+                account.id.0, instrument
+            );
+        }
+    }
+}
+
+#[test]
+fn accounting_holds_after_every_command() {
+    let inputs = Generator::new(GeneratorConfig::new(31, 3_000)).generate();
+    let mut core = TradingCore::new(EngineConfig::single_instrument(11));
+    let mut out = Vec::new();
+    let mut fills: HashMap<(u32, u32), i64> = HashMap::new();
+    for input in &inputs {
+        core.apply(input, &mut out);
+        assert!(core.fault().is_none(), "engine faulted mid-run");
+        for event in &out {
+            if let OutputEvent::Trade(trade) = event {
+                let qty = i64::try_from(trade.quantity.0).expect("fill fits i64");
+                let signed = match trade.aggressor {
+                    Side::Buy => qty,
+                    Side::Sell => -qty,
+                };
+                *fills
+                    .entry((trade.taker_account.0, trade.instrument.0))
+                    .or_default() += signed;
+                *fills
+                    .entry((trade.maker_account.0, trade.instrument.0))
+                    .or_default() -= signed;
+            }
+        }
+        assert_reservations_match_live_orders(&core);
+        assert_positions_match_fills(&core, &fills);
+    }
+}
+
 #[test]
 fn reservations_match_live_orders_and_positions_net_to_zero() {
     let (replay, events) = run(31, 8_000);

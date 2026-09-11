@@ -48,6 +48,7 @@ pub struct EngineMetrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineFault {
     SequenceExhausted,
+    Accounting,
 }
 
 pub struct TradingCore {
@@ -77,7 +78,11 @@ impl TradingCore {
             .iter()
             .map(|instrument| InstrumentRuntime {
                 config: instrument.clone(),
-                market: MarketView::new(instrument.min_price_ticks, instrument.max_price_ticks),
+                market: MarketView::new(
+                    instrument.min_price_ticks,
+                    instrument.max_price_ticks,
+                    config.max_market_depth,
+                ),
                 book: OrderBook::with_capacity(config.max_live_orders),
             })
             .collect();
@@ -332,7 +337,10 @@ impl TradingCore {
             out,
         );
 
-        let remaining = QuantityLots(request.quantity.0 - filled.0);
+        let Some(remaining) = request.quantity.0.checked_sub(filled.0).map(QuantityLots) else {
+            self.fault = Some(EngineFault::Accounting);
+            return self.reject_report(request, RejectReason::ArithmeticOverflow);
+        };
         if remaining.is_zero() {
             return self.terminal_report(request, order_id, ReportKind::Filled, filled);
         }
@@ -423,7 +431,15 @@ impl TradingCore {
 
         // Same price with a lower total keeps queue priority.
         if request.price == existing.price && request.quantity < existing.total_quantity {
-            let released = QuantityLots(existing.total_quantity.0 - request.quantity.0);
+            let Some(released) = existing
+                .total_quantity
+                .0
+                .checked_sub(request.quantity.0)
+                .map(QuantityLots)
+            else {
+                self.fault = Some(EngineFault::Accounting);
+                return self.reject_report(request, RejectReason::ArithmeticOverflow);
+            };
             self.release_reservation(
                 account_index,
                 instrument_index,
@@ -452,7 +468,13 @@ impl TradingCore {
                 OrderState::PartiallyFilled
             };
             report.cumulative_filled = existing.cumulative_filled;
-            report.remaining = QuantityLots(request.quantity.0 - existing.cumulative_filled.0);
+            report.remaining = match request.quantity.0.checked_sub(existing.cumulative_filled.0) {
+                Some(lots) => QuantityLots(lots),
+                None => {
+                    self.fault = Some(EngineFault::Accounting);
+                    return self.reject_report(request, RejectReason::ArithmeticOverflow);
+                }
+            };
             return report;
         }
 
@@ -472,7 +494,15 @@ impl TradingCore {
             return self.replace_cancelled_report(request, order_id, &existing);
         }
 
-        let target_remaining = QuantityLots(request.quantity.0 - existing.cumulative_filled.0);
+        let Some(target_remaining) = request
+            .quantity
+            .0
+            .checked_sub(existing.cumulative_filled.0)
+            .map(QuantityLots)
+        else {
+            self.fault = Some(EngineFault::Accounting);
+            return self.reject_report(request, RejectReason::ArithmeticOverflow);
+        };
         let filled = self.execute(
             instrument_index,
             account_index,
@@ -484,7 +514,15 @@ impl TradingCore {
             out,
         );
 
-        let cumulative = QuantityLots(existing.cumulative_filled.0 + filled.0);
+        let Some(cumulative) = existing
+            .cumulative_filled
+            .0
+            .checked_add(filled.0)
+            .map(QuantityLots)
+        else {
+            self.fault = Some(EngineFault::Accounting);
+            return self.reject_report(request, RejectReason::ArithmeticOverflow);
+        };
         if cumulative == request.quantity {
             let mut report = self.base_report(request, order_id);
             report.kind = ReportKind::Filled;
@@ -517,7 +555,13 @@ impl TradingCore {
             OrderState::PartiallyFilled
         };
         report.cumulative_filled = cumulative;
-        report.remaining = QuantityLots(request.quantity.0 - cumulative.0);
+        report.remaining = match request.quantity.0.checked_sub(cumulative.0) {
+            Some(lots) => QuantityLots(lots),
+            None => {
+                self.fault = Some(EngineFault::Accounting);
+                QuantityLots::ZERO
+            }
+        };
         report
     }
 
@@ -551,7 +595,11 @@ impl TradingCore {
         let mut taker_cumulative = QuantityLots::ZERO;
         for index in 0..self.fills.len() {
             let fill = self.fills[index];
-            taker_cumulative = QuantityLots(taker_cumulative.0 + fill.quantity.0);
+            let Some(next) = taker_cumulative.0.checked_add(fill.quantity.0) else {
+                self.fault = Some(EngineFault::Accounting);
+                return filled;
+            };
+            taker_cumulative = QuantityLots(next);
 
             let Some(trade_id) = self.next_trade_id.next() else {
                 self.fault = Some(EngineFault::SequenceExhausted);
@@ -630,7 +678,14 @@ impl TradingCore {
                 OrderState::PartiallyFilled
             };
             taker_report.cumulative_filled = taker_cumulative;
-            taker_report.remaining = QuantityLots(quantity.0 - taker_cumulative.0);
+            taker_report.remaining = quantity
+                .0
+                .checked_sub(taker_cumulative.0)
+                .map(QuantityLots)
+                .unwrap_or_else(|| {
+                    self.fault = Some(EngineFault::Accounting);
+                    QuantityLots::ZERO
+                });
             taker_report.last_fill_quantity = fill.quantity;
             taker_report.last_fill_price = fill.price;
             out.push(OutputEvent::Report(taker_report));
@@ -655,7 +710,9 @@ impl TradingCore {
             fill.price,
         );
         let position = &mut self.accounts[maker_account_index].positions[instrument_index];
-        apply_fill_to_position(position, maker_side, fill.quantity);
+        if apply_fill_to_position(position, maker_side, fill.quantity).is_none() {
+            self.fault = Some(EngineFault::Accounting);
+        }
     }
 
     fn settle_taker(
@@ -666,7 +723,9 @@ impl TradingCore {
         quantity: QuantityLots,
     ) {
         let position = &mut self.accounts[account_index].positions[instrument_index];
-        apply_fill_to_position(position, side, quantity);
+        if apply_fill_to_position(position, side, quantity).is_none() {
+            self.fault = Some(EngineFault::Accounting);
+        }
     }
 
     fn rest_order(
@@ -721,7 +780,10 @@ impl TradingCore {
         if inserted.is_err() {
             return;
         }
-        let remaining = QuantityLots(total.0 - filled.0);
+        let Some(remaining) = total.0.checked_sub(filled.0).map(QuantityLots) else {
+            self.fault = Some(EngineFault::Accounting);
+            return;
+        };
         self.reserve(account_index, instrument_index, side, remaining, price);
         self.live_orders.insert(
             order_id,
@@ -742,10 +804,16 @@ impl TradingCore {
         lots: QuantityLots,
         price: PriceTicks,
     ) {
-        let notional = lots
-            .checked_notional(price)
-            .unwrap_or(protocol::Notional::ZERO);
-        self.accounts[account_index].positions[instrument_index].reserve(side, lots, notional);
+        let Some(notional) = lots.checked_notional(price) else {
+            self.fault = Some(EngineFault::Accounting);
+            return;
+        };
+        if self.accounts[account_index].positions[instrument_index]
+            .reserve(side, lots, notional)
+            .is_none()
+        {
+            self.fault = Some(EngineFault::Accounting);
+        }
     }
 
     fn release_reservation(
@@ -759,10 +827,16 @@ impl TradingCore {
         if lots.is_zero() {
             return;
         }
-        let notional = lots
-            .checked_notional(price)
-            .unwrap_or(protocol::Notional::ZERO);
-        self.accounts[account_index].positions[instrument_index].release(side, lots, notional);
+        let Some(notional) = lots.checked_notional(price) else {
+            self.fault = Some(EngineFault::Accounting);
+            return;
+        };
+        if self.accounts[account_index].positions[instrument_index]
+            .release(side, lots, notional)
+            .is_none()
+        {
+            self.fault = Some(EngineFault::Accounting);
+        }
     }
 
     fn record_outcome(

@@ -62,7 +62,7 @@ after(async () => {
 });
 
 test('the stream carries a projection sequence a client can gap-check', async () => {
-  const url = `${address.replace('http', 'ws')}/stream`;
+  const url = `${address.replace('http', 'ws')}/stream?token=token`;
   const socket = new WebSocket(url);
   const frames: Record<string, unknown>[] = [];
   socket.addEventListener('message', (event) => {

@@ -44,10 +44,11 @@ pub struct MarketView {
     counters: FeedCounters,
     min_price_ticks: i64,
     max_price_ticks: i64,
+    max_depth: usize,
 }
 
 impl MarketView {
-    pub fn new(min_price_ticks: i64, max_price_ticks: i64) -> MarketView {
+    pub fn new(min_price_ticks: i64, max_price_ticks: i64, max_depth: usize) -> MarketView {
         MarketView {
             state: FeedState::Unsynchronized,
             epoch: 0,
@@ -63,6 +64,19 @@ impl MarketView {
             counters: FeedCounters::default(),
             min_price_ticks,
             max_price_ticks,
+            max_depth: max_depth.max(1),
+        }
+    }
+
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
+    /// This view is a top-N ladder, not a full market book.
+    pub fn retained_levels(&self, side: Side) -> usize {
+        match side {
+            Side::Buy => self.bids.len(),
+            Side::Sell => self.asks.len(),
         }
     }
 
@@ -223,7 +237,7 @@ impl MarketView {
                         Side::Buy => &mut self.scratch_bids,
                         Side::Sell => &mut self.scratch_asks,
                     };
-                    scratch.insert(price, quantity.0);
+                    Self::set_bounded(scratch, side, price, quantity.0, self.max_depth);
                     self.scratch_levels += 1;
                 }
             }
@@ -238,6 +252,8 @@ impl MarketView {
                     // The snapshot becomes visible only when it is fully validated.
                     std::mem::swap(&mut self.bids, &mut self.scratch_bids);
                     std::mem::swap(&mut self.asks, &mut self.scratch_asks);
+                    Self::trim(Side::Buy, &mut self.bids, self.max_depth);
+                    Self::trim(Side::Sell, &mut self.asks, self.max_depth);
                     self.state = FeedState::Live;
                     self.counters.resyncs += 1;
                 } else {
@@ -260,7 +276,7 @@ impl MarketView {
                     if quantity.is_zero() {
                         levels.remove(&price);
                     } else {
-                        levels.insert(price, quantity.0);
+                        Self::set_bounded(levels, side, price, quantity.0, self.max_depth);
                     }
                 }
             }
@@ -305,6 +321,47 @@ impl MarketView {
                     SequenceCheck::Ok
                 } else {
                     SequenceCheck::Gap
+                }
+            }
+        }
+    }
+
+    fn set_bounded(
+        levels: &mut BTreeMap<PriceTicks, u64>,
+        side: Side,
+        price: PriceTicks,
+        quantity: u64,
+        max_depth: usize,
+    ) {
+        if let std::collections::btree_map::Entry::Occupied(mut occupied) = levels.entry(price) {
+            occupied.insert(quantity);
+            return;
+        }
+        if levels.len() >= max_depth && !Self::improves(side, price, levels) {
+            return;
+        }
+        levels.insert(price, quantity);
+        Self::trim(side, levels, max_depth);
+    }
+
+    fn improves(side: Side, price: PriceTicks, levels: &BTreeMap<PriceTicks, u64>) -> bool {
+        match side {
+            Side::Buy => levels.keys().next().is_some_and(|worst| price > *worst),
+            Side::Sell => levels
+                .keys()
+                .next_back()
+                .is_some_and(|worst| price < *worst),
+        }
+    }
+
+    fn trim(side: Side, levels: &mut BTreeMap<PriceTicks, u64>, max_depth: usize) {
+        while levels.len() > max_depth {
+            match side {
+                Side::Buy => {
+                    levels.pop_first();
+                }
+                Side::Sell => {
+                    levels.pop_last();
                 }
             }
         }
@@ -374,7 +431,7 @@ mod tests {
 
     #[test]
     fn snapshot_becomes_visible_only_at_the_end() {
-        let mut view = MarketView::new(1, 10_000_000);
+        let mut view = MarketView::new(1, 10_000_000, 256);
         view.apply(1, MarketEventKind::SnapshotBegin { snapshot_seq: 1 }, 1);
         view.apply(
             2,
@@ -402,7 +459,7 @@ mod tests {
 
     #[test]
     fn interrupted_snapshot_enters_gap() {
-        let mut view = MarketView::new(1, 10_000_000);
+        let mut view = MarketView::new(1, 10_000_000, 256);
         view.apply(1, MarketEventKind::SnapshotBegin { snapshot_seq: 1 }, 1);
         view.apply(
             2,
@@ -417,7 +474,7 @@ mod tests {
 
     #[test]
     fn duplicate_is_counted_and_ignored() {
-        let mut view = MarketView::new(1, 10_000_000);
+        let mut view = MarketView::new(1, 10_000_000, 256);
         snapshot(&mut view, 1);
         let update = view.apply(
             4,
@@ -435,7 +492,7 @@ mod tests {
 
     #[test]
     fn forward_jump_enters_gap_and_stops_applying() {
-        let mut view = MarketView::new(1, 10_000_000);
+        let mut view = MarketView::new(1, 10_000_000, 256);
         snapshot(&mut view, 1);
         view.apply(
             9,
@@ -457,7 +514,7 @@ mod tests {
     #[test]
     fn out_of_range_prices_are_rejected_and_never_become_the_reference() {
         for price in [i64::MIN, i64::MIN + 9_000, -1, 0, i64::MAX, 10_000_001] {
-            let mut view = MarketView::new(1, 10_000_000);
+            let mut view = MarketView::new(1, 10_000_000, 256);
             snapshot(&mut view, 1);
             assert_eq!(view.reference_price(), Some(PriceTicks(100)));
 
@@ -491,7 +548,7 @@ mod tests {
 
     #[test]
     fn an_out_of_range_snapshot_level_stops_the_snapshot() {
-        let mut view = MarketView::new(1, 10_000_000);
+        let mut view = MarketView::new(1, 10_000_000, 256);
         view.apply(1, MarketEventKind::SnapshotBegin { snapshot_seq: 1 }, 1);
         view.apply(
             2,
@@ -508,8 +565,182 @@ mod tests {
 
     #[test]
     fn reference_price_is_the_midpoint_when_both_sides_are_valid() {
-        let mut view = MarketView::new(1, 10_000_000);
+        let mut view = MarketView::new(1, 10_000_000, 256);
         snapshot(&mut view, 1);
         assert_eq!(view.reference_price(), Some(PriceTicks(100)));
+    }
+
+    fn live(view: &mut MarketView) {
+        snapshot(view, 1);
+    }
+
+    #[test]
+    fn retained_depth_stays_bounded_for_100_000_levels() {
+        let mut view = MarketView::new(1, 1_000_000, 32);
+        live(&mut view);
+        let mut seq = 5u64;
+        for price in 1..=100_000i64 {
+            view.apply(
+                seq,
+                MarketEventKind::LevelSet {
+                    side: Side::Buy,
+                    price: PriceTicks(price),
+                    quantity: QuantityLots(1),
+                },
+                seq * 10,
+            );
+            seq += 1;
+            view.apply(
+                seq,
+                MarketEventKind::LevelSet {
+                    side: Side::Sell,
+                    price: PriceTicks(200_000 + price),
+                    quantity: QuantityLots(1),
+                },
+                seq * 10,
+            );
+            seq += 1;
+        }
+        assert_eq!(view.retained_levels(Side::Buy), 32);
+        assert_eq!(view.retained_levels(Side::Sell), 32);
+        assert_eq!(view.best_bid(), Some(PriceTicks(100_000)));
+        assert_eq!(view.best_ask(), Some(PriceTicks(101)));
+    }
+
+    #[test]
+    fn removing_the_best_level_promotes_the_next_retained_price() {
+        let mut view = MarketView::new(1, 10_000, 2);
+        live(&mut view);
+        view.apply(
+            5,
+            MarketEventKind::LevelSet {
+                side: Side::Buy,
+                price: PriceTicks(98),
+                quantity: QuantityLots(1),
+            },
+            20,
+        );
+        view.apply(
+            6,
+            MarketEventKind::LevelSet {
+                side: Side::Buy,
+                price: PriceTicks(97),
+                quantity: QuantityLots(1),
+            },
+            21,
+        );
+        assert_eq!(view.best_bid(), Some(PriceTicks(99)));
+        view.apply(
+            7,
+            MarketEventKind::LevelSet {
+                side: Side::Buy,
+                price: PriceTicks(99),
+                quantity: QuantityLots::ZERO,
+            },
+            22,
+        );
+        assert_eq!(view.best_bid(), Some(PriceTicks(98)));
+        assert_eq!(view.retained_levels(Side::Buy), 1);
+    }
+
+    #[test]
+    fn updates_outside_retained_depth_do_not_displace_the_best() {
+        let mut view = MarketView::new(1, 10_000, 1);
+        live(&mut view);
+        view.apply(
+            5,
+            MarketEventKind::LevelSet {
+                side: Side::Buy,
+                price: PriceTicks(50),
+                quantity: QuantityLots(9),
+            },
+            20,
+        );
+        assert_eq!(view.best_bid(), Some(PriceTicks(99)));
+        assert_eq!(view.retained_levels(Side::Buy), 1);
+    }
+
+    #[test]
+    fn snapshot_keeps_only_the_best_n_levels() {
+        let mut view = MarketView::new(1, 10_000, 2);
+        view.apply(1, MarketEventKind::SnapshotBegin { snapshot_seq: 1 }, 1);
+        for (index, price) in [90i64, 91, 92, 93].into_iter().enumerate() {
+            view.apply(
+                2 + index as u64,
+                MarketEventKind::SnapshotLevel {
+                    side: Side::Buy,
+                    price: PriceTicks(price),
+                    quantity: QuantityLots(1),
+                },
+                2,
+            );
+        }
+        view.apply(
+            6,
+            MarketEventKind::SnapshotEnd {
+                snapshot_seq: 1,
+                level_count: 4,
+            },
+            3,
+        );
+        assert_eq!(view.state(), FeedState::Live);
+        assert_eq!(view.retained_levels(Side::Buy), 2);
+        assert_eq!(view.best_bid(), Some(PriceTicks(93)));
+        let prices: Vec<i64> = view.levels(Side::Buy).iter().map(|(p, _)| p.0).collect();
+        assert_eq!(prices, vec![93, 92]);
+    }
+
+    #[test]
+    fn bounded_depth_replay_is_deterministic() {
+        let kinds: Vec<MarketEventKind> = (1..=200i64)
+            .map(|price| MarketEventKind::LevelSet {
+                side: Side::Buy,
+                price: PriceTicks(price),
+                quantity: QuantityLots(1),
+            })
+            .collect();
+        let first = crate::state_digest(&{
+            let mut core = crate::TradingCore::new(crate::EngineConfig::single_instrument(9));
+            let mut out = Vec::new();
+            for (index, kind) in kinds.iter().enumerate() {
+                let seq = index as u64 + 1;
+                core.apply(
+                    &protocol::EngineInput {
+                        ingress_seq: protocol::IngressSeq(seq),
+                        recv_time_ns: seq * 1_000,
+                        event: protocol::InputEvent::Market(protocol::MarketEvent {
+                            instrument: protocol::InstrumentId(1),
+                            source_seq: seq,
+                            source_time_ns: seq * 1_000,
+                            kind: *kind,
+                        }),
+                    },
+                    &mut out,
+                );
+            }
+            core
+        });
+        let second = crate::state_digest(&{
+            let mut core = crate::TradingCore::new(crate::EngineConfig::single_instrument(9));
+            let mut out = Vec::new();
+            for (index, kind) in kinds.iter().enumerate() {
+                let seq = index as u64 + 1;
+                core.apply(
+                    &protocol::EngineInput {
+                        ingress_seq: protocol::IngressSeq(seq),
+                        recv_time_ns: seq * 1_000,
+                        event: protocol::InputEvent::Market(protocol::MarketEvent {
+                            instrument: protocol::InstrumentId(1),
+                            source_seq: seq,
+                            source_time_ns: seq * 1_000,
+                            kind: *kind,
+                        }),
+                    },
+                    &mut out,
+                );
+            }
+            core
+        });
+        assert_eq!(first, second);
     }
 }

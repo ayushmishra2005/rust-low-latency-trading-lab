@@ -108,7 +108,6 @@ pub struct Sender<T> {
     inner: rtrb::Producer<T>,
     stats: Arc<QueueStats>,
     strategy: WaitStrategy,
-    capacity: usize,
 }
 
 pub struct Receiver<T> {
@@ -125,7 +124,6 @@ pub fn bounded<T>(capacity: usize, strategy: WaitStrategy) -> (Sender<T>, Receiv
             inner: producer,
             stats: Arc::clone(&stats),
             strategy,
-            capacity,
         },
         Receiver {
             inner: consumer,
@@ -147,10 +145,14 @@ impl<T> Sender<T> {
         loop {
             match self.inner.push(value) {
                 Ok(()) => {
-                    self.stats.pushed.fetch_add(1, Ordering::Relaxed);
-                    // Free slots can be stale, so this depth is an upper bound.
-                    let depth = self.capacity.saturating_sub(self.inner.slots()) as u64;
-                    self.stats.high_water.fetch_max(depth, Ordering::Relaxed);
+                    let pushed = self.stats.pushed.fetch_add(1, Ordering::Relaxed) + 1;
+                    // Sampled every 64 pushes from the existing counters so a
+                    // successful send does not read the other core's free-slot
+                    // count. Depth can lag by up to 63 events.
+                    if pushed % 64 == 0 {
+                        let depth = pushed.saturating_sub(self.stats.popped());
+                        self.stats.high_water.fetch_max(depth, Ordering::Relaxed);
+                    }
                     return true;
                 }
                 Err(rtrb::PushError::Full(returned)) => {

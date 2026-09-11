@@ -8,7 +8,7 @@ import type { FastifyInstance } from 'fastify';
 import { openDatabase } from '../src/db.js';
 import { GatewayClient } from '../src/gateway.js';
 import { Projection } from '../src/projection.js';
-import { buildServer } from '../src/server.js';
+import { buildServer, websocketWouldBlock } from '../src/server.js';
 import { SettlementDispatcher } from '../src/settlement/dispatcher.js';
 import { SettlementOutbox } from '../src/settlement/outbox.js';
 import { SimulatedVenue } from '../src/settlement/simulated.js';
@@ -19,6 +19,7 @@ process.env.RLTL_LOG_LEVEL = 'silent';
 const gateway = new FakeGateway();
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rltl-api-'));
 const API_TOKEN = 'test-token';
+const auth = { authorization: `Bearer ${API_TOKEN}` };
 
 let app: FastifyInstance;
 let client: GatewayClient;
@@ -68,14 +69,14 @@ after(async () => {
 
 test('read endpoints report how far the projection has read', async () => {
   for (const url of ['/orders', '/trades', '/positions', '/settlements']) {
-    const response = await app.inject({ method: 'GET', url });
+    const response = await app.inject({ method: 'GET', url, headers: auth });
     assert.equal(response.statusCode, 200, url);
     const body = response.json() as { asOfEngineSeq: string; projectionSeq: string };
     assert.match(body.asOfEngineSeq, /^\d+$/);
     assert.match(body.projectionSeq, /^\d+$/);
   }
 
-  const trades = (await app.inject({ method: 'GET', url: '/trades' })).json() as {
+  const trades = (await app.inject({ method: 'GET', url: '/trades', headers: auth })).json() as {
     trades: { trade_id: string; quantity_lots: string }[];
   };
   assert.equal(trades.trades.length, 2);
@@ -85,7 +86,7 @@ test('read endpoints report how far the projection has read', async () => {
 });
 
 test('the book comes from the engine snapshot and unknown symbols are 404', async () => {
-  const response = await app.inject({ method: 'GET', url: '/book/LAB-USD?depth=1' });
+  const response = await app.inject({ method: 'GET', url: '/book/LAB-USD?depth=1', headers: auth });
   assert.equal(response.statusCode, 200);
   const body = response.json() as {
     bids: unknown[];
@@ -96,12 +97,12 @@ test('the book comes from the engine snapshot and unknown symbols are 404', asyn
   assert.equal(body.asks.length, 1);
   assert.match(body.asOfEngineSeq, /^\d+$/);
 
-  const missing = await app.inject({ method: 'GET', url: '/book/NOPE' });
+  const missing = await app.inject({ method: 'GET', url: '/book/NOPE', headers: auth });
   assert.equal(missing.statusCode, 404);
 });
 
 test('metrics expose bounded labels only', async () => {
-  const response = await app.inject({ method: 'GET', url: '/metrics' });
+  const response = await app.inject({ method: 'GET', url: '/metrics', headers: auth });
   assert.equal(response.statusCode, 200);
   assert.match(response.headers['content-type'] as string, /text\/plain/);
   const body = response.body;
@@ -198,6 +199,20 @@ test('the operational API exposes no order entry', async () => {
     const response = await app.inject({ method: 'POST', url, payload: {} });
     assert.notEqual(response.statusCode, 200, `${url} must not accept order entry`);
   }
+});
+
+test('sensitive reads require a bearer token', async () => {
+  for (const url of ['/orders', '/trades', '/positions', '/settlements', '/metrics', '/book/LAB-USD']) {
+    const denied = await app.inject({ method: 'GET', url });
+    assert.equal(denied.statusCode, 401, url);
+  }
+  const health = await app.inject({ method: 'GET', url: '/health' });
+  assert.equal(health.statusCode, 200);
+});
+
+test('a slow websocket client is treated as blocked once the buffer threshold is crossed', () => {
+  assert.equal(websocketWouldBlock(1_048_576, 1_048_576), false);
+  assert.equal(websocketWouldBlock(1_048_577, 1_048_576), true);
 });
 
 test('health degrades instead of failing when the gateway is silent', async () => {

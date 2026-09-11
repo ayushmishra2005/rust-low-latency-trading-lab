@@ -42,6 +42,7 @@ jobs:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked
       - run: cargo fuzz build --dev
+        working-directory: fuzz
 
   control-api:
     name: Control API
@@ -59,7 +60,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
-      # Venue integration tests skip themselves without a local validator or ledger.
+      # Venue clients run in the Solana and Canton jobs against local services.
       - run: npm test
 
   solana:
@@ -89,6 +90,25 @@ jobs:
           solana-keygen new --no-bip39-passphrase --silent --force
           npm ci
           anchor test
+      - name: Run SolanaVenue tests against the local validator
+        env:
+          RLTL_REQUIRE_VENUE: "1"
+          RLTL_SOLANA_RPC: http://127.0.0.1:8899
+        run: |
+          PROGRAM_ID=HYAoYYczVZE7scJbDP2EGA8FbLYspcxrw9BRLQ4i6ux4
+          solana-test-validator --reset --quiet \
+            --bpf-program "$PROGRAM_ID" adapters/solana/target/deploy/settlement.so &
+          for _ in $(seq 1 90); do
+            if solana cluster-version --url "$RLTL_SOLANA_RPC" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          solana cluster-version --url "$RLTL_SOLANA_RPC"
+          cd apps/control-api
+          npm ci
+          npx tsc --noEmit
+          node --test --import tsx test/solana.test.ts
 
   canton:
     name: Canton workflow
@@ -103,8 +123,40 @@ jobs:
         run: |
           curl -sSL https://get.daml.com | sh -s 2.10.6
           echo "$HOME/.daml/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/control-api/package-lock.json
       - name: Build and test the settlement model
         working-directory: adapters/canton
         run: |
           daml build
           daml test
+      - name: Run CantonVenue tests against a local JSON API
+        env:
+          RLTL_REQUIRE_VENUE: "1"
+          RLTL_CANTON_JSON_API: http://127.0.0.1:7575
+        working-directory: adapters/canton
+        run: |
+          DAR=.daml/dist/canton-0.0.1.dar
+          daml sandbox --port 6865 --dar "$DAR" &
+          for _ in $(seq 1 90); do
+            if python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",6865),1); s.close()' 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          daml json-api --ledger-host 127.0.0.1 --ledger-port 6865 --http-port 7575 --allow-insecure-tokens &
+          for _ in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:7575/readyz >/dev/null || curl -sf http://127.0.0.1:7575/livez >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          PACKAGE_ID=$(python3 -c 'import json,subprocess,sys; data=json.loads(subprocess.check_output(["daml","damlc","inspect-dar","--json",sys.argv[1]])); print(data.get("main_package_id") or next(iter(data["packages"])))' "$DAR")
+          test -n "$PACKAGE_ID"
+          cd ../../apps/control-api
+          npm ci
+          npx tsc --noEmit
+          RLTL_CANTON_PACKAGE_ID="$PACKAGE_ID" node --test --import tsx test/canton.test.ts

@@ -1,5 +1,6 @@
 //! End-to-end IPC tests over a real Unix socket with a real engine run.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,7 +121,13 @@ async fn outputs_stream_in_order_and_snapshot_carries_engine_sequence() {
     let mut last_seq = 0u64;
     let mut total = 0usize;
     loop {
-        let response = call(&mut stream, "outputs", json!({ "limit": 250 }), None).await;
+        let response = call(
+            &mut stream,
+            "outputs",
+            json!({ "limit": 250 }),
+            Some("secret"),
+        )
+        .await;
         assert!(response["ok"].as_bool().unwrap(), "{response}");
         let events = response["result"]["events"].as_array().unwrap().clone();
         if events.is_empty() {
@@ -135,7 +142,7 @@ async fn outputs_stream_in_order_and_snapshot_carries_engine_sequence() {
     }
     assert!(total > 0);
 
-    let snapshot = call(&mut stream, "snapshot", json!({}), None).await;
+    let snapshot = call(&mut stream, "snapshot", json!({}), Some("secret")).await;
     assert!(snapshot["ok"].as_bool().unwrap());
     let as_of: u64 = snapshot["result"]["asOfEngineSeq"]
         .as_str()
@@ -156,14 +163,20 @@ async fn wide_integers_are_strings_so_javascript_cannot_round_them() {
     serve(&fixture, Some("secret"));
     let mut stream = client(&fixture).await;
 
-    let response = call(&mut stream, "outputs", json!({ "limit": 50 }), None).await;
+    let response = call(
+        &mut stream,
+        "outputs",
+        json!({ "limit": 50 }),
+        Some("secret"),
+    )
+    .await;
     for event in response["result"]["events"].as_array().unwrap() {
         assert!(event["outputSeq"].is_string());
         assert!(event["engineSeq"].is_string());
         assert!(event["engineTimeNs"].is_string());
     }
 
-    let snapshot = call(&mut stream, "snapshot", json!({}), None).await;
+    let snapshot = call(&mut stream, "snapshot", json!({}), Some("secret")).await;
     let position = &snapshot["result"]["positions"][0];
     assert!(position["openBuyNotional"].is_string());
     assert!(position["positionLots"].is_string());
@@ -263,21 +276,33 @@ async fn replay_runs_on_an_isolated_core_and_is_reproducible() {
 
     let params = json!({ "seed": 4, "events": 400 });
     let first = call(&mut stream, "startReplay", params.clone(), Some("secret")).await;
-    let second = call(&mut stream, "startReplay", params, Some("secret")).await;
-    assert_eq!(
-        first["result"]["stateDigest"],
-        second["result"]["stateDigest"]
-    );
+    assert_eq!(first["result"]["status"], "running");
+    let busy = call(&mut stream, "startReplay", params, Some("secret")).await;
+    assert_eq!(busy["result"]["status"], "rejected");
 
     let job = first["result"]["jobId"].as_str().unwrap().to_string();
-    let status = call(&mut stream, "replayStatus", json!({ "jobId": job }), None).await;
+    let mut status = Value::Null;
+    for _ in 0..200 {
+        status = call(
+            &mut stream,
+            "replayStatus",
+            json!({ "jobId": job }),
+            Some("secret"),
+        )
+        .await;
+        if status["result"]["status"] == "completed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(status["result"]["status"], "completed");
+    assert!(status["result"]["stateDigest"].as_str().unwrap().len() == 64);
 
     let missing = call(
         &mut stream,
         "replayStatus",
         json!({ "jobId": "replay-999" }),
-        None,
+        Some("secret"),
     )
     .await;
     assert_eq!(missing["error"]["code"], "not_found");
@@ -299,7 +324,13 @@ async fn a_corrupt_journal_tail_is_reported_and_does_not_kill_the_gateway() {
 
     let mut failed = false;
     for _ in 0..10 {
-        let response = call(&mut stream, "outputs", json!({ "limit": 100 }), None).await;
+        let response = call(
+            &mut stream,
+            "outputs",
+            json!({ "limit": 100 }),
+            Some("secret"),
+        )
+        .await;
         if !response["ok"].as_bool().unwrap() {
             assert_eq!(response["error"]["code"], "journal_error");
             failed = true;
@@ -310,4 +341,208 @@ async fn a_corrupt_journal_tail_is_reported_and_does_not_kill_the_gateway() {
 
     let healthy = call(&mut stream, "health", json!({}), None).await;
     assert!(healthy["ok"].as_bool().unwrap());
+}
+
+fn serve_with(fixture: &Fixture, token: Option<&str>, limits: server::Limits) -> Arc<Gateway> {
+    let gateway = Arc::new(Gateway::new(
+        fixture.control.clone(),
+        fixture.journal.clone(),
+        token.map(str::to_string),
+    ));
+    let served = Arc::clone(&gateway);
+    let socket = fixture.socket.clone();
+    tokio::spawn(async move {
+        let _ = server::serve_with(&socket, served, limits).await;
+    });
+    gateway
+}
+
+#[tokio::test]
+async fn the_control_socket_is_owner_only() {
+    let fixture = Fixture::new("mode");
+    run_engine(&fixture, 50);
+    serve(&fixture, Some("secret"));
+    let _ = client(&fixture).await;
+    let mode = std::fs::metadata(&fixture.socket)
+        .expect("socket metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[tokio::test]
+async fn sensitive_reads_require_the_token() {
+    let fixture = Fixture::new("read-auth");
+    run_engine(&fixture, 200);
+    serve(&fixture, Some("secret"));
+    let mut stream = client(&fixture).await;
+
+    for method in ["outputs", "snapshot"] {
+        let denied = call(&mut stream, method, json!({}), None).await;
+        assert_eq!(denied["error"]["code"], "unauthorized", "{method}");
+    }
+
+    let health = call(&mut stream, "health", json!({}), None).await;
+    assert!(health["ok"].as_bool().unwrap());
+
+    let snapshot = call(&mut stream, "snapshot", json!({}), Some("secret")).await;
+    assert!(snapshot["ok"].as_bool().unwrap());
+    let outputs = call(
+        &mut stream,
+        "outputs",
+        json!({ "limit": 10 }),
+        Some("secret"),
+    )
+    .await;
+    assert!(outputs["ok"].as_bool().unwrap());
+
+    let kill = call(
+        &mut stream,
+        "engageKill",
+        json!({ "engaged": true }),
+        Some("secret"),
+    )
+    .await;
+    assert!(kill["ok"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn no_configured_token_fails_closed_for_protected_reads() {
+    let fixture = Fixture::new("read-notoken");
+    run_engine(&fixture, 50);
+    serve(&fixture, None);
+    let mut stream = client(&fixture).await;
+    let snapshot = call(&mut stream, "snapshot", json!({}), Some("anything")).await;
+    assert_eq!(snapshot["error"]["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn a_stalled_client_is_disconnected() {
+    let fixture = Fixture::new("timeout");
+    run_engine(&fixture, 50);
+    serve_with(
+        &fixture,
+        Some("secret"),
+        server::Limits {
+            max_connections: 8,
+            read_timeout: Duration::from_millis(80),
+        },
+    );
+    let mut stream = client(&fixture).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut buf = [0u8; 1];
+    assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn the_connection_cap_is_enforced() {
+    let fixture = Fixture::new("cap");
+    run_engine(&fixture, 50);
+    serve_with(
+        &fixture,
+        Some("secret"),
+        server::Limits {
+            max_connections: 1,
+            read_timeout: Duration::from_secs(5),
+        },
+    );
+    let mut first = client(&fixture).await;
+    let mut extra = client(&fixture).await;
+    let dropped = match extra.write_all(&1u32.to_le_bytes()).await {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => true,
+        Ok(()) => {
+            let mut buf = [0u8; 1];
+            extra.read(&mut buf).await.unwrap() == 0
+        }
+        Err(error) => panic!("unexpected extra-connection error: {error}"),
+    };
+    assert!(dropped, "the extra connection must be dropped");
+    let health = call(&mut first, "health", json!({}), None).await;
+    assert!(health["ok"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn a_large_replay_stays_off_the_worker_and_health_stays_up() {
+    let fixture = Fixture::new("async-replay");
+    run_engine(&fixture, 50);
+    serve(&fixture, Some("secret"));
+    let mut stream = client(&fixture).await;
+
+    let started = call(
+        &mut stream,
+        "startReplay",
+        json!({ "seed": 8, "events": 8_000 }),
+        Some("secret"),
+    )
+    .await;
+    assert_eq!(started["result"]["status"], "running");
+    let health = call(&mut stream, "health", json!({}), None).await;
+    assert!(health["ok"].as_bool().unwrap());
+
+    let job = started["result"]["jobId"].as_str().unwrap().to_string();
+    let mut status = Value::Null;
+    for _ in 0..400 {
+        status = call(
+            &mut stream,
+            "replayStatus",
+            json!({ "jobId": job }),
+            Some("secret"),
+        )
+        .await;
+        if status["result"]["status"] == "completed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(status["result"]["status"], "completed");
+}
+
+#[tokio::test]
+async fn replay_job_history_is_bounded() {
+    let fixture = Fixture::new("replay-evict");
+    run_engine(&fixture, 20);
+    serve(&fixture, Some("secret"));
+    let mut stream = client(&fixture).await;
+
+    let mut last = String::new();
+    for _ in 0..33 {
+        let started = call(
+            &mut stream,
+            "startReplay",
+            json!({ "seed": 1, "events": 8 }),
+            Some("secret"),
+        )
+        .await;
+        last = started["result"]["jobId"].as_str().unwrap().to_string();
+        for _ in 0..100 {
+            let status = call(
+                &mut stream,
+                "replayStatus",
+                json!({ "jobId": last }),
+                Some("secret"),
+            )
+            .await;
+            if status["result"]["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let oldest = call(
+        &mut stream,
+        "replayStatus",
+        json!({ "jobId": "replay-1" }),
+        Some("secret"),
+    )
+    .await;
+    assert_eq!(oldest["error"]["code"], "not_found");
+    let newest = call(
+        &mut stream,
+        "replayStatus",
+        json!({ "jobId": last }),
+        Some("secret"),
+    )
+    .await;
+    assert_eq!(newest["result"]["status"], "completed");
 }

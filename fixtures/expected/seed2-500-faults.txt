@@ -5,4 +5,4 @@ outputs = 511
 trades = 69
 input_digest = 5e12e80e6f9e1692782ebcb9551af08b55957b3aebdc8fedf03108cf86e4dca8
 output_digest = e3bf19b2153156f860d62b5e5a3ee9acc6e51d51c97ad754a612bd7d28f7238d
-state_digest = 340b88c429d0c0f4b1d092584b3d25eb8fbb188ded23bcf58132ab087d61f925
+state_digest = 4dcb76151b04a7a4e6d62a415ad4edf5be4d76819193d570e1fcf3c89678d89f

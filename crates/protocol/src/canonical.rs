@@ -130,7 +130,11 @@ pub fn decode_output(bytes: &[u8]) -> Result<(OutputEvent, usize), DecodeError> 
                 2 => EngineStateEvent::KillSwitchReleased,
                 3 => EngineStateEvent::AccountEnabledChanged {
                     account: AccountId(reader.u32()?),
-                    enabled: reader.u8()? != 0,
+                    enabled: match reader.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(reader.invalid_field()),
+                    },
                 },
                 4 => EngineStateEvent::AccountLimitsChanged {
                     account: AccountId(reader.u32()?),

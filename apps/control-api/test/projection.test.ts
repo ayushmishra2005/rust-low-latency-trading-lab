@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test, { after, before, beforeEach } from 'node:test';
+import { after, before, beforeEach, describe, test } from 'node:test';
 
 import { openDatabase } from '../src/db.js';
 import { GatewayClient } from '../src/gateway.js';
@@ -12,18 +12,22 @@ import { FakeGateway, reportEvent, resetEventIds, tradeEvent } from './fake-gate
 const gateway = new FakeGateway();
 let dbDir: string;
 
+describe('projection', { concurrency: 1 }, () => {
 before(async () => {
   await gateway.start();
 });
 
 after(async () => {
   await gateway.stop();
-  fs.rmSync(dbDir, { recursive: true, force: true });
+  if (dbDir !== undefined) {
+    fs.rmSync(dbDir, { recursive: true, force: true });
+  }
 });
 
 beforeEach(() => {
   resetEventIds();
   gateway.reset();
+  gateway.runId = '1';
 });
 
 function newDb(name: string) {
@@ -156,4 +160,76 @@ test('a silent gateway times out instead of hanging the control plane', async ()
 
   client.close();
   db.close();
+});
+
+test('the same run resumes and a different run does not merge', async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'rltl-runid-')), 'p.db');
+  const client = new GatewayClient(gateway.socketPath, undefined);
+  gateway.runId = 'A';
+  gateway.publish([tradeEvent({ tradeId: '1', outputSeq: '1' }), tradeEvent({ tradeId: '2', outputSeq: '2' })]);
+
+  const first = openDatabase(file);
+  const before = new Projection(first, client);
+  assert.equal(await before.poll(), 2);
+  first.close();
+
+  const resumedDb = openDatabase(file);
+  const resumed = new Projection(resumedDb, client);
+  assert.equal(resumed.position.runId, 'A');
+  assert.equal(resumed.health, 'healthy');
+  gateway.rewind();
+  assert.equal(await resumed.poll(), 2);
+  assert.equal(
+    (resumedDb.prepare('SELECT COUNT(*) AS total FROM trades').get() as { total: bigint }).total,
+    2n,
+  );
+
+  gateway.reset();
+  resetEventIds();
+  gateway.runId = 'B';
+  gateway.publish([
+    tradeEvent({ tradeId: '1', outputSeq: '1', quantityLots: '99' }),
+    tradeEvent({ tradeId: '2', outputSeq: '2', quantityLots: '99' }),
+  ]);
+  assert.equal(await resumed.poll(), 0);
+  assert.equal(resumed.health, 'run_mismatch');
+  const qty = resumedDb.prepare('SELECT quantity_lots FROM trades WHERE trade_id = 1').get() as {
+    quantity_lots: bigint;
+  };
+  assert.equal(qty.quantity_lots, 5n);
+
+  client.close();
+  resumedDb.close();
+});
+
+test('a sequence gap latches degraded state until an explicit resync', async () => {
+  const db = newDb('gap');
+  const client = new GatewayClient(gateway.socketPath, undefined);
+  const projection = new Projection(db, client);
+  gateway.publish([tradeEvent(), tradeEvent()]);
+  assert.equal(await projection.poll(), 2);
+
+  gateway.publish([tradeEvent({ outputSeq: '4', tradeId: '4' })]);
+  await projection.poll();
+  assert.equal(projection.health, 'degraded');
+  assert.equal(projection.counters.gapsObserved, 1n);
+  assert.equal((db.prepare('SELECT COUNT(*) AS total FROM trades').get() as { total: bigint }).total, 2n);
+
+  gateway.publish([tradeEvent({ outputSeq: '5', tradeId: '5' })]);
+  assert.equal(await projection.poll(), 0);
+  assert.equal(projection.health, 'degraded');
+  assert.equal((db.prepare('SELECT COUNT(*) AS total FROM trades').get() as { total: bigint }).total, 2n);
+
+  gateway.reset();
+  resetEventIds();
+  gateway.publish([tradeEvent(), tradeEvent()]);
+  await projection.rebuild();
+  assert.equal(projection.health, 'healthy');
+  assert.equal(await projection.poll(), 2);
+  assert.equal(projection.health, 'healthy');
+  assert.equal((db.prepare('SELECT COUNT(*) AS total FROM trades').get() as { total: bigint }).total, 2n);
+
+  client.close();
+  db.close();
+});
 });

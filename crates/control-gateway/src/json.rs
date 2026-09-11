@@ -130,6 +130,7 @@ pub fn snapshot(snapshot: &EngineSnapshot) -> Value {
         .collect();
 
     json!({
+        "runId": snapshot.run_id.to_string(),
         "asOfEngineSeq": snapshot.as_of_engine_seq.0.to_string(),
         "engineTimeNs": snapshot.engine_time_ns.to_string(),
         "globalKill": snapshot.global_kill,

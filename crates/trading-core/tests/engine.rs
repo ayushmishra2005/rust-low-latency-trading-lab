@@ -555,6 +555,41 @@ fn cancelled_orders_never_trade_again() {
 }
 
 #[test]
+fn partial_and_full_fills_update_remaining_and_positions() {
+    let mut harness = Harness::new();
+    harness.sync_feed();
+    harness.limit(1, 100, Side::Sell, 101, 10);
+    let partial = last_report(harness.limit(2, 200, Side::Buy, 101, 4));
+    assert_eq!(partial.kind, ReportKind::Filled);
+    assert_eq!(partial.cumulative_filled, QuantityLots(4));
+    assert_eq!(partial.remaining, QuantityLots(0));
+    assert_eq!(harness.core.accounts()[0].positions[0].position_lots, -4);
+    assert_eq!(harness.core.accounts()[0].positions[0].open_sell_lots, 6);
+    assert_eq!(harness.core.accounts()[1].positions[0].position_lots, 4);
+
+    let rest = last_report(harness.limit(2, 201, Side::Buy, 101, 6));
+    assert_eq!(rest.kind, ReportKind::Filled);
+    assert_eq!(harness.core.accounts()[0].positions[0].position_lots, -10);
+    assert_eq!(harness.core.accounts()[0].positions[0].open_sell_lots, 0);
+    assert_eq!(harness.core.live_order_count(), 0);
+    harness.check_invariants();
+}
+
+#[test]
+fn position_limit_rejects_before_the_book_changes() {
+    let mut config = EngineConfig::single_instrument(7);
+    config.accounts[1].limits.max_position_lots = 5;
+    let mut harness = Harness::with_config(config);
+    harness.sync_feed();
+    harness.limit(1, 100, Side::Sell, 101, 10);
+    let rejected = last_report(harness.limit(2, 200, Side::Buy, 101, 6));
+    assert_eq!(rejected.reject_reason, Some(RejectReason::MaxPosition));
+    assert_eq!(harness.core.accounts()[1].positions[0].position_lots, 0);
+    assert_eq!(harness.core.live_order_count(), 1);
+    harness.check_invariants();
+}
+
+#[test]
 fn output_sequences_are_dense_and_increasing() {
     let mut harness = Harness::new();
     harness.sync_feed();

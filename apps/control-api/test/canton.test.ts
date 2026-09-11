@@ -15,7 +15,11 @@ import { settlementIdFor } from '../src/settlement/manifest.js';
 //   cd adapters/canton && daml start --start-navigator=no --json-api-port 7575
 const baseUrl = process.env.RLTL_CANTON_JSON_API;
 const packageId = process.env.RLTL_CANTON_PACKAGE_ID;
+const required = process.env.RLTL_REQUIRE_VENUE === '1';
 const enabled = baseUrl !== undefined && packageId !== undefined;
+if (required && !enabled) {
+  throw new Error('RLTL_REQUIRE_VENUE=1 but RLTL_CANTON_JSON_API or RLTL_CANTON_PACKAGE_ID is missing');
+}
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rltl-canton-'));
 let operator: string;
@@ -177,6 +181,7 @@ test('an unreachable participant reports unknown, never failed', { skip: !enable
   const trades = db.prepare('SELECT COUNT(*) AS total FROM trades').get() as { total: bigint };
   assert.equal(trades.total, 2n, 'an executed trade stays executed while settlement is delayed');
 
+  outbox.makeDue();
   const online = new SettlementDispatcher(outbox, venue, 10);
   await online.tick();
   assert.equal(outbox.get(settlementId)!.status, 'confirmed');

@@ -3,12 +3,16 @@
 //! Tokio lives here and nowhere near matching. Frames are bounded before they
 //! are parsed and every mutation requires the configured token.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::time::timeout;
 
 use crate::state::Gateway;
 use crate::wire::{
@@ -16,29 +20,75 @@ use crate::wire::{
     RiskLimitsParams, MAX_FRAME_BYTES, SCHEMA_VERSION,
 };
 
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub max_connections: usize,
+    pub read_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            max_connections: 32,
+            read_timeout: Duration::from_secs(15),
+        }
+    }
+}
+
 pub async fn serve(path: &Path, gateway: Arc<Gateway>) -> std::io::Result<()> {
+    serve_with(path, gateway, Limits::default()).await
+}
+
+pub async fn serve_with(path: &Path, gateway: Arc<Gateway>, limits: Limits) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
     if path.exists() {
         std::fs::remove_file(path)?;
     }
     let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     println!("control gateway listening on {}", path.display());
 
+    let live = Arc::new(AtomicUsize::new(0));
     loop {
         let (stream, _) = listener.accept().await?;
+        let current = live.fetch_add(1, Ordering::Relaxed);
+        if current >= limits.max_connections {
+            live.fetch_sub(1, Ordering::Relaxed);
+            drop(stream);
+            continue;
+        }
         let gateway = Arc::clone(&gateway);
+        let live = Arc::clone(&live);
         tokio::spawn(async move {
-            if let Err(error) = handle(stream, gateway).await {
+            if let Err(error) = handle(stream, gateway, limits.read_timeout).await {
                 eprintln!("control connection ended: {error}");
             }
+            live.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
 
-async fn handle(mut stream: UnixStream, gateway: Arc<Gateway>) -> std::io::Result<()> {
+async fn handle(
+    mut stream: UnixStream,
+    gateway: Arc<Gateway>,
+    read_timeout: Duration,
+) -> std::io::Result<()> {
     let mut length = [0u8; 4];
     loop {
-        if stream.read_exact(&mut length).await.is_err() {
-            return Ok(());
+        match timeout(read_timeout, stream.read_exact(&mut length)).await {
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "control read timed out",
+                ));
+            }
+            Ok(Err(_)) => return Ok(()),
+            Ok(Ok(_)) => {}
         }
         let len = u32::from_le_bytes(length) as usize;
         if len == 0 || len > MAX_FRAME_BYTES {
@@ -48,7 +98,11 @@ async fn handle(mut stream: UnixStream, gateway: Arc<Gateway>) -> std::io::Resul
             ));
         }
         let mut body = vec![0u8; len];
-        stream.read_exact(&mut body).await?;
+        timeout(read_timeout, stream.read_exact(&mut body))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "control read timed out")
+            })??;
 
         let mut response = match serde_json::from_slice::<Request>(&body) {
             // Journal reads and replay jobs block, so keep them off the reactor.
@@ -89,11 +143,18 @@ fn dispatch(gateway: &Gateway, request: Request) -> Response {
         );
     }
 
-    let mutating = matches!(
+    let protected = matches!(
         request.method.as_str(),
-        "setRiskLimits" | "setAccountEnabled" | "engageKill" | "startReplay"
+        "setRiskLimits"
+            | "setAccountEnabled"
+            | "engageKill"
+            | "startReplay"
+            | "snapshot"
+            | "outputs"
+            | "replayStatus"
+            | "resetJournal"
     );
-    if mutating {
+    if protected {
         if !gateway.requires_token() {
             return Response::failed(
                 &request.command_id,
@@ -241,6 +302,10 @@ fn dispatch(gateway: &Gateway, request: Request) -> Response {
                 engine_seq,
             ),
         },
+        "resetJournal" => {
+            gateway.reset_journal_tail();
+            Response::ok(&request.command_id, json!({ "accepted": true }), engine_seq)
+        }
         "replayStatus" => {
             let job_id = request
                 .params

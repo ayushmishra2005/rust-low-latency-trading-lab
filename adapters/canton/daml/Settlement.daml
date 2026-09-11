@@ -38,7 +38,7 @@ template Holding
 
     choice Debit : ContractId Holding
       with delta : Int
-      controller operator
+      controller operator, owner
       do
         assertMsg "debit must be positive" (delta > 0)
         assertMsg "insufficient holding" (amount >= delta)

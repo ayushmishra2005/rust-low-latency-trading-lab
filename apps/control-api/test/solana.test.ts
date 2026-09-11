@@ -23,7 +23,11 @@ import { settlementIdFor } from '../src/settlement/manifest.js';
 //   solana-test-validator --bpf-program <program id> adapters/solana/target/deploy/settlement.so
 const rpc = process.env.RLTL_SOLANA_RPC;
 const idlPath = path.resolve(import.meta.dirname, '../../../adapters/solana/target/idl/settlement.json');
+const required = process.env.RLTL_REQUIRE_VENUE === '1';
 const enabled = rpc !== undefined && fs.existsSync(idlPath);
+if (required && !enabled) {
+  throw new Error('RLTL_REQUIRE_VENUE=1 but RLTL_SOLANA_RPC or the local IDL is missing');
+}
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rltl-solana-'));
 const authority = Keypair.generate();
@@ -215,6 +219,7 @@ test('an unreachable RPC endpoint reports unknown, never failed', { skip: !enabl
   assert.equal(trades.total, 2n);
 
   // Once the endpoint works again the same identity settles.
+  outbox.makeDue();
   const online = new SettlementDispatcher(outbox, venue, 10);
   await online.tick();
   assert.equal(outbox.get(settlementId)!.status, 'confirmed');

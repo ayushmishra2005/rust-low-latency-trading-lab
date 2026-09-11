@@ -27,6 +27,7 @@ export class FakeGateway {
 
   private server: net.Server | null = null;
   private readonly sockets = new Set<net.Socket>();
+  runId = '1';
   private queued: OutputEvent[] = [];
   private cursor = 0;
   private engineSeq = 0n;
@@ -128,9 +129,13 @@ export class FakeGateway {
       asOfEngineSeq,
     });
 
-    const mutating = ['setRiskLimits', 'engageKill', 'startReplay', 'setAccountEnabled'].includes(
-      request.method,
-    );
+    const mutating = [
+      'setRiskLimits',
+      'engageKill',
+      'startReplay',
+      'setAccountEnabled',
+      'resetJournal',
+    ].includes(request.method);
     if (mutating && this.unauthorized) {
       return fail('unauthorized', 'invalid control token');
     }
@@ -139,6 +144,7 @@ export class FakeGateway {
       case 'health':
         return ok({
           status: 'ready',
+          runId: this.runId,
           uptimeSeconds: 1,
           journalPath: '/tmp/fake.journal',
           deliveredOutputs: String(this.cursor),
@@ -155,8 +161,12 @@ export class FakeGateway {
         this.cursor += events.length;
         return ok({ events });
       }
+      case 'resetJournal':
+        this.rewind();
+        return ok({ accepted: true });
       case 'snapshot':
         return ok({
+          runId: this.runId,
           asOfEngineSeq,
           engineTimeNs: '1000',
           globalKill: false,

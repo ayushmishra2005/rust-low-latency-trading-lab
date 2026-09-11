@@ -10,7 +10,7 @@ use protocol::{
 use trading_core::book::{NewOrder, OrderBook};
 use trading_core::generator::to_frame;
 use trading_core::matching::match_order;
-use trading_core::{EngineConfig, Generator, GeneratorConfig, TradingCore};
+use trading_core::{EngineConfig, Generator, GeneratorConfig, RequestCache, TradingCore};
 
 fn encoded_frames() -> Vec<Vec<u8>> {
     Generator::new(GeneratorConfig::new(1, 2_000))
@@ -224,5 +224,74 @@ fn engine(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, codec, book, engine);
+fn filled_cache(window: usize) -> RequestCache {
+    use protocol::{
+        AccountId, ClientOrderId, EngineSeq, InstrumentId, OrderId, OrderState, OrderType,
+        OutputSeq, ReportKind, RequestId, Side,
+    };
+    let mut cache = RequestCache::new(window);
+    for index in 0..window as u64 {
+        cache.record(
+            RequestId(index + 1),
+            index + 1,
+            protocol::ExecutionReport {
+                output_seq: OutputSeq(index + 1),
+                engine_seq: EngineSeq(index + 1),
+                engine_time_ns: 1,
+                account: AccountId(1),
+                instrument: InstrumentId(1),
+                request_id: RequestId(index + 1),
+                client_order_id: ClientOrderId(index + 1),
+                order_id: OrderId(index + 1),
+                kind: ReportKind::Accepted,
+                state: OrderState::Working,
+                side: Side::Buy,
+                order_type: OrderType::Limit,
+                price: PriceTicks(99),
+                total_quantity: QuantityLots(1),
+                cumulative_filled: QuantityLots::ZERO,
+                remaining: QuantityLots(1),
+                last_fill_quantity: QuantityLots::ZERO,
+                last_fill_price: PriceTicks(0),
+                reject_reason: None,
+            },
+        );
+    }
+    cache
+}
+
+/// Linear scan of the ring. Kept only so the bench can show the old cost.
+fn scan_lookup(
+    cache: &RequestCache,
+    request_id: protocol::RequestId,
+    fingerprint: u64,
+) -> Option<trading_core::CacheHit> {
+    for (id, stored, outcome) in cache.canonical_entries() {
+        if id == request_id {
+            return Some(if stored == fingerprint {
+                trading_core::CacheHit::Retry(outcome)
+            } else {
+                trading_core::CacheHit::Conflict
+            });
+        }
+    }
+    None
+}
+
+fn dedup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dedup_lookup");
+    for window in [64usize, 256, 4096] {
+        let cache = filled_cache(window);
+        let target = protocol::RequestId(window as u64 / 2);
+        group.bench_function(format!("indexed_{window}"), |b| {
+            b.iter(|| black_box(cache.lookup(black_box(target), black_box(target.0))));
+        });
+        group.bench_function(format!("scan_{window}"), |b| {
+            b.iter(|| black_box(scan_lookup(&cache, black_box(target), black_box(target.0))));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, codec, book, engine, dedup);
 criterion_main!(benches);

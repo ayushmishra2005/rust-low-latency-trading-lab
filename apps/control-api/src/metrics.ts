@@ -83,6 +83,17 @@ export function renderMetrics(input: {
     values: [{ value: position.lastOutputSeq }],
   });
   samples.push({
+    name: 'rltl_projection_health',
+    help: 'Whether the projection is presenting financial state as healthy.',
+    type: 'gauge',
+    values: [
+      {
+        labels: { state: projection.health },
+        value: projection.health === 'healthy' ? 1 : 0,
+      },
+    ],
+  });
+  samples.push({
     name: 'rltl_projection_as_of_engine_seq',
     help: 'Engine sequence the projection is current to.',
     type: 'gauge',

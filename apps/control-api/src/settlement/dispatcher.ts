@@ -78,7 +78,7 @@ export class SettlementDispatcher {
     } catch (error) {
       if (error instanceof ManifestConflict) {
         this.counters.manifestConflicts += 1n;
-        this.outbox.recordFailed(row.settlementId, error.message);
+        this.outbox.recordNeedsOperator(row.settlementId, error.message);
         return;
       }
       throw error;

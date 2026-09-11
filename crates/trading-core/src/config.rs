@@ -62,6 +62,8 @@ pub struct EngineConfig {
     pub market_protection_ticks: i64,
     /// Retained request fingerprints per account.
     pub dedup_window: usize,
+    /// Best bid/ask levels retained per side in the market view.
+    pub max_market_depth: usize,
 }
 
 impl EngineConfig {
@@ -75,6 +77,7 @@ impl EngineConfig {
             max_market_age_ns: 1_000_000_000,
             market_protection_ticks: 50,
             dedup_window: 256,
+            max_market_depth: 256,
         }
     }
 }

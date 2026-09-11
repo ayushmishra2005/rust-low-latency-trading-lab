@@ -13,3 +13,4 @@ dist/
 *.db-shm
 *.journal
 *.feed.local
+test-ledger/

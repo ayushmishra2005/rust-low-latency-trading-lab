@@ -1,7 +1,9 @@
 import type Database from 'better-sqlite3';
 import type { GatewayClient } from './gateway.js';
-import { readState, writeState } from './db.js';
-import type { EngineSnapshot, OutputEvent, ReportEvent, TradeEvent } from './types.js';
+import { readState, readStateText, writeState } from './db.js';
+import type { EngineSnapshot, GatewayHealth, OutputEvent, ReportEvent, TradeEvent } from './types.js';
+
+export type ProjectionHealth = 'healthy' | 'degraded' | 'run_mismatch';
 
 export interface ProjectionCounters {
   eventsApplied: bigint;
@@ -31,6 +33,8 @@ export class Projection {
   private lastOutputSeq: bigint;
   private projectionSeq: bigint;
   private lastEngineSeq: bigint;
+  private runId: string;
+  private healthState: ProjectionHealth;
   private listeners: ProjectionListener[] = [];
   private timer: NodeJS.Timeout | null = null;
   private running = false;
@@ -43,13 +47,29 @@ export class Projection {
     this.lastOutputSeq = readState(db, 'last_output_seq');
     this.projectionSeq = readState(db, 'projection_seq');
     this.lastEngineSeq = readState(db, 'as_of_engine_seq');
+    this.runId = readStateText(db, 'run_id') || '0';
+    const stored = readStateText(db, 'projection_health');
+    this.healthState =
+      stored === 'degraded' || stored === 'run_mismatch' ? stored : 'healthy';
   }
 
-  get position(): { lastOutputSeq: bigint; projectionSeq: bigint; asOfEngineSeq: bigint } {
+  get health(): ProjectionHealth {
+    return this.healthState;
+  }
+
+  get position(): {
+    lastOutputSeq: bigint;
+    projectionSeq: bigint;
+    asOfEngineSeq: bigint;
+    runId: string;
+    health: ProjectionHealth;
+  } {
     return {
       lastOutputSeq: this.lastOutputSeq,
       projectionSeq: this.projectionSeq,
       asOfEngineSeq: this.lastEngineSeq,
+      runId: this.runId,
+      health: this.healthState,
     };
   }
 
@@ -85,6 +105,11 @@ export class Projection {
     }
     this.running = true;
     try {
+      const health = await this.gateway.call<GatewayHealth>('health');
+      this.bindRun(health.runId ?? '0');
+      if (this.healthState !== 'healthy' || this.runId === '0') {
+        return 0;
+      }
       const result = await this.gateway.call<{ events: OutputEvent[] }>('outputs', {
         limit: this.batchSize,
       });
@@ -101,6 +126,45 @@ export class Projection {
     }
   }
 
+  async rebuild(): Promise<void> {
+    const wipe = this.db.transaction(() => {
+      this.db.exec(
+        'DELETE FROM orders; DELETE FROM trades; DELETE FROM positions; DELETE FROM risk_rejects; DELETE FROM settlements;',
+      );
+      writeState(this.db, 'last_output_seq', 0n);
+      writeState(this.db, 'as_of_engine_seq', 0n);
+      writeState(this.db, 'projection_seq', 0n);
+      writeState(this.db, 'run_id', '0');
+      writeState(this.db, 'projection_health', 'healthy');
+    });
+    wipe();
+    this.lastOutputSeq = 0n;
+    this.projectionSeq = 0n;
+    this.lastEngineSeq = 0n;
+    this.runId = '0';
+    this.healthState = 'healthy';
+    await this.gateway.call('resetJournal');
+  }
+
+  private bindRun(incoming: string): void {
+    if (incoming === '0' || incoming === '') {
+      return;
+    }
+    if (this.runId === '0' || this.runId === '') {
+      this.runId = incoming;
+      writeState(this.db, 'run_id', incoming);
+      return;
+    }
+    if (this.runId !== incoming) {
+      this.latch('run_mismatch');
+    }
+  }
+
+  private latch(next: ProjectionHealth): void {
+    this.healthState = next;
+    writeState(this.db, 'projection_health', next);
+  }
+
   private apply(events: OutputEvent[]): void {
     const applied: { event: OutputEvent; projectionSeq: bigint }[] = [];
     const applyBatch = this.db.transaction((batch: OutputEvent[]) => {
@@ -110,9 +174,9 @@ export class Projection {
           continue;
         }
         if (outputSeq !== this.lastOutputSeq + 1n && this.lastOutputSeq !== 0n) {
-          // A gap means the journal was replaced or a read was missed. Record it;
-          // consumers resnapshot instead of trusting a partial stream.
           this.counters.gapsObserved += 1n;
+          this.latch('degraded');
+          return;
         }
         switch (event.kind) {
           case 'trade':
@@ -150,11 +214,12 @@ export class Projection {
     this.db
       .prepare(
         `INSERT OR IGNORE INTO trades
-           (trade_id, output_seq, engine_seq, engine_time_ns, instrument, maker_account,
+           (run_id, trade_id, output_seq, engine_seq, engine_time_ns, instrument, maker_account,
             taker_account, aggressor, price_ticks, quantity_lots, settlement_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
       )
       .run(
+        this.runId,
         BigInt(event.tradeId),
         BigInt(event.outputSeq),
         BigInt(event.engineSeq),
