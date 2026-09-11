@@ -15,6 +15,10 @@ pub struct ReferenceOrder {
 
 impl ReferenceOrder {
     pub fn remaining(&self) -> QuantityLots {
+        debug_assert!(
+            self.total_quantity.0 >= self.cumulative_filled.0,
+            "cumulative fill exceeded total"
+        );
         QuantityLots(self.total_quantity.0 - self.cumulative_filled.0)
     }
 }

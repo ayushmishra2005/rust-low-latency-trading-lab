@@ -385,9 +385,11 @@ pub fn state_digest(core: &TradingCore) -> Digest {
 }
 
 pub fn digest_hex(digest: &Digest) -> String {
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for &byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
 }
@@ -395,6 +397,20 @@ pub fn digest_hex(digest: &Digest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digest_hex_encodes_every_byte() {
+        let mut digest = [0u8; 32];
+        digest[0] = 0x00;
+        digest[1] = 0x0f;
+        digest[2] = 0xa0;
+        digest[31] = 0xff;
+        let hex = digest_hex(&digest);
+        assert_eq!(hex.len(), 64);
+        assert!(hex.starts_with("000fa0"));
+        assert!(hex.ends_with("ff"));
+        assert!(!hex.contains('A'));
+    }
 
     #[test]
     fn framing_keeps_different_collection_splits_apart() {

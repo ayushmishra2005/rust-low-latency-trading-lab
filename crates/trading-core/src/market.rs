@@ -216,6 +216,17 @@ impl MarketView {
             }
         }
 
+        if let MarketEventKind::FeedReset { new_epoch } = kind {
+            if new_epoch <= self.epoch {
+                self.counters.out_of_order += 1;
+                return MarketUpdate {
+                    previous_state,
+                    state: self.state,
+                    duplicate: false,
+                };
+            }
+        }
+
         self.counters.applied += 1;
         self.last_update_time_ns = recv_time_ns;
 
@@ -742,5 +753,82 @@ mod tests {
             core
         });
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_newer_feed_epoch_is_accepted() {
+        let mut view = MarketView::new(1, 10_000_000, 256);
+        snapshot(&mut view, 1);
+        assert_eq!(view.best_bid(), Some(PriceTicks(99)));
+        view.apply(5, MarketEventKind::FeedReset { new_epoch: 3 }, 20);
+        assert_eq!(view.epoch(), 3);
+        assert_eq!(view.state(), FeedState::Unsynchronized);
+        assert_eq!(view.best_bid(), None);
+        assert_eq!(view.last_source_seq(), 0);
+    }
+
+    #[test]
+    fn the_same_or_older_feed_epoch_is_ignored() {
+        let mut view = MarketView::new(1, 10_000_000, 256);
+        snapshot(&mut view, 1);
+        view.apply(5, MarketEventKind::FeedReset { new_epoch: 4 }, 20);
+        snapshot(&mut view, 10);
+        assert_eq!(view.state(), FeedState::Live);
+        assert_eq!(view.best_bid(), Some(PriceTicks(99)));
+
+        let same = view.apply(14, MarketEventKind::FeedReset { new_epoch: 4 }, 30);
+        assert_eq!(view.epoch(), 4);
+        assert_eq!(view.state(), FeedState::Live);
+        assert_eq!(view.best_bid(), Some(PriceTicks(99)));
+        assert!(!same.duplicate);
+        assert_eq!(view.counters().out_of_order, 1);
+
+        let older = view.apply(15, MarketEventKind::FeedReset { new_epoch: 2 }, 31);
+        assert_eq!(view.epoch(), 4);
+        assert_eq!(view.state(), FeedState::Live);
+        assert_eq!(view.best_bid(), Some(PriceTicks(99)));
+        assert!(!older.duplicate);
+        assert_eq!(view.counters().out_of_order, 2);
+    }
+
+    #[test]
+    fn feed_reset_epochs_replay_deterministically() {
+        let kinds = [
+            MarketEventKind::FeedReset { new_epoch: 2 },
+            MarketEventKind::FeedReset { new_epoch: 2 },
+            MarketEventKind::FeedReset { new_epoch: 1 },
+            MarketEventKind::FeedReset { new_epoch: 5 },
+        ];
+        let digest = |kinds: &[MarketEventKind]| {
+            let mut core = crate::TradingCore::new(crate::EngineConfig::single_instrument(3));
+            let mut out = Vec::new();
+            for (index, kind) in kinds.iter().enumerate() {
+                let seq = index as u64 + 1;
+                core.apply(
+                    &protocol::EngineInput {
+                        ingress_seq: protocol::IngressSeq(seq),
+                        recv_time_ns: seq * 1_000,
+                        event: protocol::InputEvent::Market(protocol::MarketEvent {
+                            instrument: protocol::InstrumentId(1),
+                            source_seq: seq,
+                            source_time_ns: seq * 1_000,
+                            kind: *kind,
+                        }),
+                    },
+                    &mut out,
+                );
+            }
+            (
+                crate::state_digest(&core),
+                core.instrument(protocol::InstrumentId(1))
+                    .unwrap()
+                    .market
+                    .epoch(),
+            )
+        };
+        let first = digest(&kinds);
+        let second = digest(&kinds);
+        assert_eq!(first, second);
+        assert_eq!(first.1, 5);
     }
 }

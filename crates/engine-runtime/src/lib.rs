@@ -7,7 +7,9 @@ pub mod pipeline;
 pub mod queue;
 pub mod snapshot;
 
-pub use harness::{open_loop_pipeline, queue_round_trip, LatencyStats, PipelineBench};
+pub use harness::{
+    open_loop_pipeline, queue_round_trip, timer_read_pair_baseline, LatencyStats, PipelineBench,
+};
 pub use journal::{read_journal, JournalError, JournalRecovery, JournalTail, JournalWriter};
 pub use pipeline::{
     run, run_with_journal, ControlHandle, FeedSource, JournalSync, PipelineConfig, QueueReport,

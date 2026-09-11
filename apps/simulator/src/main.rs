@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use engine_runtime::harness::{open_loop_pipeline, queue_round_trip, BenchConfig, LatencyStats};
+use engine_runtime::harness::{
+    open_loop_pipeline, queue_round_trip, timer_read_pair_baseline, BenchConfig, LatencyStats,
+};
 use engine_runtime::{
     ControlHandle, FeedSource, JournalSync, PipelineConfig, RunSummary, WaitStrategy,
 };
@@ -435,6 +437,11 @@ fn bench(
     println!();
     println!("workload: seeded generator seed={seed} events={events}");
     println!("queue: rtrb SPSC capacity={capacity} wait={}", wait.label());
+    println!();
+
+    println!("timer read-pair baseline (1000000 samples):");
+    println!("  {}", timer_read_pair_baseline(1_000_000));
+    println!("  not subtracted from the latency numbers below");
     println!();
 
     println!("queue round-trip latency ({queue_samples} samples):");

@@ -95,6 +95,34 @@ pub fn queue_round_trip(samples: usize, wait: WaitStrategy) -> LatencyStats {
     LatencyStats::from(&histogram)
 }
 
+/// Cost of two `Instant::elapsed` reads, the pair the harness uses as a stamp.
+/// Reported separately and never subtracted from pipeline latency.
+pub fn timer_read_pair_baseline(samples: usize) -> LatencyStats {
+    let origin = Instant::now();
+    for _ in 0..1_000 {
+        let _ = origin.elapsed();
+    }
+    let mut histogram = histogram();
+    for _ in 0..samples {
+        let first = origin.elapsed().as_nanos() as u64;
+        let second = origin.elapsed().as_nanos() as u64;
+        histogram.record(second.saturating_sub(first).max(1)).ok();
+    }
+    LatencyStats::from(&histogram)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timer_read_pair_baseline_records_samples() {
+        let stats = timer_read_pair_baseline(2_000);
+        assert_eq!(stats.count, 2_000);
+        assert!(stats.p50_ns >= 1);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineBench {
     /// Scheduled arrival to report. Includes time the producer spent behind

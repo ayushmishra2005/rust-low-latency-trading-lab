@@ -277,7 +277,8 @@ a stated offered load.
 **These are development benchmarks taken on a macOS laptop, not isolated production-host latency
 claims.** There is no core pinning, no isolated CPU set, no interrupt steering, and other processes
 were running. Tail percentiles in particular should be read as "what this laptop did five times in a
-row", not as a platform guarantee.
+row", not as a platform guarantee. Timing-call overhead is measured separately
+(`timer_read_pair_baseline` in the same bench command) and is not subtracted from latency results.
 
 ### Runtime with journal (same command)
 

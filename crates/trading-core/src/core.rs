@@ -295,7 +295,7 @@ impl TradingCore {
 
         let outcome = match request.kind {
             RequestKind::New => self.handle_new(request, out),
-            RequestKind::Cancel => self.handle_cancel(request, out),
+            RequestKind::Cancel => self.handle_cancel(request),
             RequestKind::Replace => self.handle_replace(request, out),
         };
 
@@ -371,11 +371,7 @@ impl TradingCore {
         report
     }
 
-    fn handle_cancel(
-        &mut self,
-        request: &OrderRequest,
-        _out: &mut [OutputEvent],
-    ) -> ExecutionReport {
+    fn handle_cancel(&mut self, request: &OrderRequest) -> ExecutionReport {
         if !self.account_index.contains_key(&request.account) {
             return self.reject_report(request, RejectReason::UnknownAccount);
         }

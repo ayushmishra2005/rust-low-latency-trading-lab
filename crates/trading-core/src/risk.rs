@@ -129,6 +129,7 @@ impl TradingCore {
 
         let reference = self.reference_price(instrument_index)?;
         let account = &self.accounts()[account_index];
+        debug_assert!(request.quantity.0 >= existing.cumulative_filled.0);
         let new_remaining = QuantityLots(request.quantity.0 - existing.cumulative_filled.0);
 
         if new_remaining > account.limits.max_order_quantity {
